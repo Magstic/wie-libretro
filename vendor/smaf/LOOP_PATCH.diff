@@ -1,0 +1,246 @@
+diff -ruN smaf_orig/smaf/smaf_cli/src/main.rs smaf_work/smaf/smaf_cli/src/main.rs
+--- smaf_orig/smaf/smaf_cli/src/main.rs	2026-05-18 06:08:24.994424204 +0000
++++ smaf_work/smaf/smaf_cli/src/main.rs	2026-05-18 06:08:02.709489240 +0000
+@@ -1,16 +1,16 @@
+ use core::time::Duration;
+-use std::{env::args, fs};
++use std::{env::args, fs, process};
+ 
+-use midir::MidiOutput;
++use midir::{MidiOutput, MidiOutputConnection};
+ use rodio::{buffer::SamplesBuffer, OutputStream, Sink};
+ use tokio::time::sleep;
+ 
+-use smaf_player::{parse_smaf, SmafEvent};
++use smaf_player::{parse_smaf, repeat_smaf_events, SmafEvent};
+ 
+ #[tokio::main(flavor = "current_thread")]
+ pub async fn main() {
+-    let file = args().nth(1).expect("No file given");
+-    let data = fs::read(file).expect("Failed to read file");
++    let options = parse_args();
++    let data = fs::read(&options.file).expect("Failed to read file");
+ 
+     let midi_out = MidiOutput::new("smaf_cli").unwrap();
+     let midi_ports = midi_out.ports();
+@@ -22,9 +22,75 @@
+ 
+     let events = parse_smaf(&data);
+ 
++    if options.repeat_forever {
++        loop {
++            play_events(&events, &mut midi_out, &sink).await;
++        }
++    } else {
++        let events = repeat_smaf_events(&events, options.repeat_count);
++        play_events(&events, &mut midi_out, &sink).await;
++    }
++}
++
++struct Options {
++    file: String,
++    repeat_count: usize,
++    repeat_forever: bool,
++}
++
++fn parse_args() -> Options {
++    let mut file = None;
++    let mut repeat_count = 1usize;
++    let mut repeat_forever = false;
++    let mut args = args().skip(1);
++
++    while let Some(arg) = args.next() {
++        match arg.as_str() {
++            "--loop" | "-l" => repeat_forever = true,
++            "--repeat" | "-r" => {
++                let value = args.next().unwrap_or_else(|| {
++                    eprintln!("--repeat requires a play count");
++                    process::exit(2);
++                });
++                repeat_count = value.parse::<usize>().unwrap_or_else(|_| {
++                    eprintln!("Invalid --repeat value: {value}");
++                    process::exit(2);
++                });
++            }
++            "--help" | "-h" => {
++                print_usage();
++                process::exit(0);
++            }
++            _ if file.is_none() => file = Some(arg),
++            _ => {
++                eprintln!("Unexpected argument: {arg}");
++                print_usage();
++                process::exit(2);
++            }
++        }
++    }
++
++    let Some(file) = file else {
++        eprintln!("No file given");
++        print_usage();
++        process::exit(2);
++    };
++
++    Options {
++        file,
++        repeat_count,
++        repeat_forever,
++    }
++}
++
++fn print_usage() {
++    eprintln!("Usage: smaf_cli [--loop | --repeat COUNT] <file.mmf>");
++}
++
++async fn play_events(events: &[(usize, SmafEvent)], midi_out: &mut MidiOutputConnection, sink: &Sink) {
+     let mut now = 0;
+-    for (time, event) in events {
+-        sleep(Duration::from_millis((time - now) as u64)).await;
++    for (time, event) in events.iter() {
++        sleep(Duration::from_millis(time.saturating_sub(now) as u64)).await;
+ 
+         match event {
+             SmafEvent::Wave {
+@@ -32,32 +98,32 @@
+                 sampling_rate,
+                 data,
+             } => {
+-                let buffer = SamplesBuffer::new(channel as _, sampling_rate as _, data);
++                let buffer = SamplesBuffer::new(*channel as _, *sampling_rate as _, data.clone());
+                 sink.append(buffer);
+             }
+             SmafEvent::MidiNoteOn { channel, note, velocity } => {
+-                midi_out.send(&[0x90 | channel, note, velocity]).unwrap();
++                midi_out.send(&[0x90 | *channel, *note, *velocity]).unwrap();
+             }
+             SmafEvent::MidiNoteOff { channel, note, velocity } => {
+-                midi_out.send(&[0x80 | channel, note, velocity]).unwrap();
++                midi_out.send(&[0x80 | *channel, *note, *velocity]).unwrap();
+             }
+             SmafEvent::MidiProgramChange { channel, program } => {
+-                midi_out.send(&[0xC0 | channel, program]).unwrap();
++                midi_out.send(&[0xC0 | *channel, *program]).unwrap();
+             }
+             SmafEvent::MidiControlChange { channel, control, value } => {
+-                midi_out.send(&[0xB0 | channel, control, value]).unwrap();
++                midi_out.send(&[0xB0 | *channel, *control, *value]).unwrap();
+             }
+             SmafEvent::MidiPitchBend { channel, value } => {
+                 midi_out
+-                    .send(&[0xE0 | channel, (value & 0x7f) as u8, ((value >> 7) & 0x7f) as u8])
++                    .send(&[0xE0 | *channel, (*value & 0x7f) as u8, ((*value >> 7) & 0x7f) as u8])
+                     .unwrap();
+             }
+             SmafEvent::MidiSysEx(data) => {
+-                midi_out.send(&data).unwrap();
++                midi_out.send(data).unwrap();
+             }
+             SmafEvent::End => {}
+         }
+ 
+-        now = time;
++        now = *time;
+     }
+ }
+diff -ruN smaf_orig/smaf/smaf_player/src/lib.rs smaf_work/smaf/smaf_player/src/lib.rs
+--- smaf_orig/smaf/smaf_player/src/lib.rs	2026-05-18 06:08:24.994940523 +0000
++++ smaf_work/smaf/smaf_player/src/lib.rs	2026-05-18 06:07:52.342363545 +0000
+@@ -11,6 +11,7 @@
+ 
+ use self::adpcm::decode_adpcm;
+ 
++#[derive(Clone, Debug, Eq, PartialEq)]
+ pub enum SmafEvent {
+     Wave { channel: u8, sampling_rate: u32, data: Vec<i16> },
+     MidiNoteOn { channel: u8, note: u8, velocity: u8 },
+@@ -52,6 +53,59 @@
+     result
+ }
+ 
++/// Returns the playback duration of a parsed SMAF event stream in milliseconds.
++///
++/// The parser emits one or more [`SmafEvent::End`] markers, but for looping the
++/// practical loop length is the maximum timestamp in the merged event stream.
++pub fn smaf_duration(events: &[(usize, SmafEvent)]) -> usize {
++    events.iter().map(|(time, _)| *time).max().unwrap_or(0)
++}
++
++/// Repeats an already parsed SMAF event stream a finite number of times.
++///
++/// `play_count` is the total number of plays, not the number of extra repeats:
++/// `1` returns the original timing, `2` plays the stream twice, and `0` returns
++/// only an immediate end marker. Intermediate [`SmafEvent::End`] markers are
++/// removed so callers only see one final end marker.
++pub fn repeat_smaf_events(events: &[(usize, SmafEvent)], play_count: usize) -> Vec<(usize, SmafEvent)> {
++    let duration = smaf_duration(events);
++    let mut result = Vec::new();
++
++    if play_count == 0 {
++        result.push((0, SmafEvent::End));
++        return result;
++    }
++
++    if duration == 0 {
++        result.extend(events.iter().cloned());
++        return result;
++    }
++
++    let non_end_count = events.iter().filter(|(_, event)| !matches!(event, SmafEvent::End)).count();
++    result.reserve(non_end_count.saturating_mul(play_count).saturating_add(1));
++
++    for iteration in 0..play_count {
++        let offset = duration.saturating_mul(iteration);
++        for (time, event) in events.iter() {
++            if matches!(event, SmafEvent::End) {
++                continue;
++            }
++            result.push((offset.saturating_add(*time), event.clone()));
++        }
++    }
++
++    result.push((duration.saturating_mul(play_count), SmafEvent::End));
++    result.sort_by_key(|&(time, _)| time);
++    result
++}
++
++/// Parses a SMAF/MMF file and repeats the resulting event stream a finite number
++/// of times. See [`repeat_smaf_events`] for the exact `play_count` semantics.
++pub fn parse_smaf_repeated(raw: &[u8], play_count: usize) -> Vec<(usize, SmafEvent)> {
++    let events = parse_smaf(raw);
++    repeat_smaf_events(&events, play_count)
++}
++
+ fn parse_score_track_events(track: &ScoreTrack, mut handy_channel_offset: u8) -> (Vec<(usize, SmafEvent)>, u8) {
+     let mut result = Vec::new();
+     let mut tone_map = ToneMap::new();
+@@ -810,4 +864,30 @@
+             .iter()
+             .any(|(_, event)| matches!(event, SmafEvent::MidiNoteOn { channel: 15, note: 84, .. })));
+     }
++
++    #[test]
++    fn repeats_smaf_events_by_duration_without_intermediate_end_markers() {
++        let events = [
++            (0, SmafEvent::MidiProgramChange { channel: 0, program: 1 }),
++            (10, SmafEvent::MidiNoteOn { channel: 0, note: 60, velocity: 100 }),
++            (90, SmafEvent::MidiNoteOff { channel: 0, note: 60, velocity: 0 }),
++            (100, SmafEvent::End),
++        ];
++
++        let repeated = super::repeat_smaf_events(&events, 2);
++
++        assert_eq!(super::smaf_duration(&events), 100);
++        assert_eq!(repeated.len(), 7);
++        assert_eq!(repeated[0], (0, SmafEvent::MidiProgramChange { channel: 0, program: 1 }));
++        assert_eq!(repeated[3], (100, SmafEvent::MidiProgramChange { channel: 0, program: 1 }));
++        assert_eq!(repeated[6], (200, SmafEvent::End));
++        assert_eq!(repeated.iter().filter(|(_, event)| matches!(event, SmafEvent::End)).count(), 1);
++    }
++
++    #[test]
++    fn zero_repeat_count_returns_immediate_end_marker() {
++        let events = [(100, SmafEvent::End)];
++
++        assert_eq!(super::repeat_smaf_events(&events, 0), [(0, SmafEvent::End)]);
++    }
+ }

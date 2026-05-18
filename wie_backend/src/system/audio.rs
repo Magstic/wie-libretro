@@ -7,6 +7,7 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use smaf_player::{SmafEvent, parse_smaf};
+use spin::Mutex;
 
 use crate::{System, audio_sink::AudioSink};
 
@@ -23,6 +24,7 @@ enum AudioFile {
 
 pub struct Audio {
     sink: Arc<Box<dyn AudioSink>>,
+    midi_channels: Arc<Mutex<MidiChannelAllocator>>,
     files: BTreeMap<AudioHandle, AudioFile>,
     playing: BTreeMap<AudioHandle, Arc<AtomicBool>>,
     last_audio_handle: AudioHandle,
@@ -32,6 +34,7 @@ impl Audio {
     pub fn new(sink: Box<dyn AudioSink>) -> Self {
         Self {
             sink: Arc::new(sink),
+            midi_channels: Arc::new(Mutex::new(MidiChannelAllocator::default())),
             files: BTreeMap::new(),
             playing: BTreeMap::new(),
             last_audio_handle: 0,
@@ -48,6 +51,14 @@ impl Audio {
     }
 
     pub fn play(&mut self, system: &System, audio_handle: AudioHandle) -> Result<(), AudioError> {
+        self.play_with_loop_count(system, audio_handle, 1)
+    }
+
+    pub fn play_repeated(&mut self, system: &System, audio_handle: AudioHandle, repeat: bool) -> Result<(), AudioError> {
+        self.play_with_loop_count(system, audio_handle, if repeat { -1 } else { 1 })
+    }
+
+    pub fn play_with_loop_count(&mut self, system: &System, audio_handle: AudioHandle, loop_count: i32) -> Result<(), AudioError> {
         let player = match self.files.get(&audio_handle) {
             Some(AudioFile::Smaf(data)) => SmafPlayer::new(data),
             None => return Err(AudioError::InvalidHandle),
@@ -57,14 +68,32 @@ impl Audio {
 
         let mut system_clone = system.clone();
         let sink_clone = self.sink.clone();
+        let midi_channel_map = MidiChannelMap::allocate(self.midi_channels.clone(), &player.used_midi_channels());
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
         self.playing.insert(audio_handle, stop_flag);
 
+        let loop_count = normalize_loop_count(loop_count);
+
         // TODO use dedicated audio player task
         system.spawn(async move || {
-            player.play(&mut system_clone, &**sink_clone, &stop_flag_clone).await;
+            let mut remaining = loop_count;
+
+            loop {
+                player.play_once(&mut system_clone, &**sink_clone, &stop_flag_clone, &midi_channel_map).await;
+
+                if stop_flag_clone.load(Ordering::Relaxed) || !player.can_repeat() {
+                    break;
+                }
+
+                if let Some(count) = remaining.as_mut() {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        break;
+                    }
+                }
+            }
 
             Ok(())
         });
@@ -98,7 +127,25 @@ impl SmafPlayer {
         Self { events: parse_smaf(data) }
     }
 
-    pub async fn play(&self, system: &mut System, sink: &dyn AudioSink, stop_flag: &AtomicBool) {
+    fn used_midi_channels(&self) -> BTreeSet<u8> {
+        self.events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                SmafEvent::MidiNoteOn { channel, .. }
+                | SmafEvent::MidiNoteOff { channel, .. }
+                | SmafEvent::MidiProgramChange { channel, .. }
+                | SmafEvent::MidiControlChange { channel, .. }
+                | SmafEvent::MidiPitchBend { channel, .. } => Some(channel & 0x0f),
+                SmafEvent::Wave { .. } | SmafEvent::MidiSysEx(_) | SmafEvent::End => None,
+            })
+            .collect()
+    }
+
+    fn can_repeat(&self) -> bool {
+        self.events.iter().any(|(time, event)| *time > 0 || !matches!(event, SmafEvent::End))
+    }
+
+    async fn play_once(&self, system: &mut System, sink: &dyn AudioSink, stop_flag: &AtomicBool, midi_channel_map: &MidiChannelMap) {
         let mut active_notes: Vec<(u8, u8)> = Vec::new();
         let mut used_channels: BTreeSet<u8> = BTreeSet::new();
 
@@ -126,21 +173,33 @@ impl SmafPlayer {
                     sink.play_wave(*channel, *sampling_rate, data);
                 }
                 SmafEvent::MidiNoteOn { channel, note, velocity } => {
-                    sink.midi_note_on(*channel, *note, *velocity);
-                    active_notes.push((*channel, *note));
-                    used_channels.insert(*channel);
+                    let channel = midi_channel_map.map(*channel);
+                    sink.midi_note_on(channel, *note, *velocity);
+                    active_notes.push((channel, *note));
+                    used_channels.insert(channel);
                 }
                 SmafEvent::MidiNoteOff { channel, note, velocity } => {
-                    sink.midi_note_off(*channel, *note, *velocity);
-                    active_notes.retain(|(c, n)| !(*c == *channel && *n == *note));
+                    let channel = midi_channel_map.map(*channel);
+                    sink.midi_note_off(channel, *note, *velocity);
+                    active_notes.retain(|(c, n)| !(*c == channel && *n == *note));
                 }
                 SmafEvent::MidiProgramChange { channel, program } => {
-                    sink.midi_program_change(*channel, *program);
-                    used_channels.insert(*channel);
+                    let channel = midi_channel_map.map(*channel);
+                    sink.midi_program_change(channel, *program);
+                    used_channels.insert(channel);
                 }
                 SmafEvent::MidiControlChange { channel, control, value } => {
-                    sink.midi_control_change(*channel, *control, *value);
-                    used_channels.insert(*channel);
+                    let channel = midi_channel_map.map(*channel);
+                    sink.midi_control_change(channel, *control, *value);
+                    used_channels.insert(channel);
+                }
+                SmafEvent::MidiPitchBend { channel, value } => {
+                    let channel = midi_channel_map.map(*channel);
+                    sink.midi_pitch_bend(channel, *value);
+                    used_channels.insert(channel);
+                }
+                SmafEvent::MidiSysEx(data) => {
+                    sink.midi_sysex(data);
                 }
                 SmafEvent::End => {}
             }
@@ -158,6 +217,103 @@ impl SmafPlayer {
             sink.midi_control_change(*channel, 64, 0); // sustain off
             sink.midi_control_change(*channel, 120, 0); // all sound off
             sink.midi_control_change(*channel, 123, 0); // all notes off
+        }
+    }
+}
+
+
+fn normalize_loop_count(loop_count: i32) -> Option<u32> {
+    match loop_count {
+        0 => Some(1),
+        x if x < 0 => None,
+        x => Some(x as u32),
+    }
+}
+
+#[derive(Default)]
+struct MidiChannelAllocator {
+    used: [bool; 16],
+}
+
+impl MidiChannelAllocator {
+    fn reserve(&mut self, channel: u8) -> bool {
+        let channel = usize::from(channel);
+        if self.used[channel] {
+            return false;
+        }
+
+        self.used[channel] = true;
+        true
+    }
+
+    fn release(&mut self, channel: u8) {
+        self.used[usize::from(channel)] = false;
+    }
+
+    fn first_free_melodic_channel(&self) -> Option<u8> {
+        (0..16).find(|channel| *channel != 9 && !self.used[*channel]).map(|channel| channel as _)
+    }
+}
+
+struct MidiChannelMap {
+    allocator: Arc<Mutex<MidiChannelAllocator>>,
+    allocated_channels: Vec<u8>,
+    mapped_channels: BTreeMap<u8, u8>,
+}
+
+impl MidiChannelMap {
+    fn allocate(allocator: Arc<Mutex<MidiChannelAllocator>>, source_channels: &BTreeSet<u8>) -> Self {
+        let mut mapped_channels = BTreeMap::new();
+        let mut allocated_channels = Vec::new();
+
+        {
+            let mut allocator_guard = allocator.lock();
+            for source in source_channels {
+                let source = source & 0x0f;
+                if mapped_channels.contains_key(&source) {
+                    continue;
+                }
+
+                if allocator_guard.reserve(source) {
+                    mapped_channels.insert(source, source);
+                    allocated_channels.push(source);
+                    continue;
+                }
+
+                let destination = if source == 9 {
+                    None
+                } else {
+                    allocator_guard.first_free_melodic_channel()
+                };
+
+                if let Some(destination) = destination {
+                    allocator_guard.reserve(destination);
+                    mapped_channels.insert(source, destination);
+                    allocated_channels.push(destination);
+                } else {
+                    mapped_channels.insert(source, source);
+                }
+            }
+        }
+
+        Self {
+            allocator,
+            allocated_channels,
+            mapped_channels,
+        }
+    }
+
+    fn map(&self, channel: u8) -> u8 {
+        let channel = channel & 0x0f;
+        self.mapped_channels.get(&channel).copied().unwrap_or(channel)
+    }
+}
+
+impl Drop for MidiChannelMap {
+    fn drop(&mut self) {
+        let mut allocator = self.allocator.lock();
+        for channel in &self.allocated_channels {
+            allocator.release(*channel);
         }
     }
 }

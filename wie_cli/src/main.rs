@@ -25,8 +25,8 @@ use std::{
 
 use clap::Parser;
 use gilrs::GamepadId;
-use midir::MidiOutput;
-use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer, conversions::SampleTypeConverter};
+use midir::{MidiOutput, MidiOutputPort};
+use rodio::{DeviceSinkBuilder, buffer::SamplesBuffer, conversions::SampleTypeConverter};
 use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
 
 use wie_backend::{Emulator, Event, Filesystem, Instant, KeyCode, Options, Platform, ProfileSample, Screen, extract_zip};
@@ -76,7 +76,7 @@ impl WieCliPlatform {
         }
 
         let output_sink = default_output.unwrap();
-        let player = Player::connect_new(output_sink.mixer());
+        let mixer = output_sink.mixer().clone();
 
         loop {
             let result = rx.recv();
@@ -98,8 +98,7 @@ impl WieCliPlatform {
                 SampleTypeConverter::new(wave_data.into_iter()).collect::<Vec<_>>(),
             );
 
-            // TODO we should be able to play multiple audio at once
-            player.append(buffer);
+            mixer.add(buffer);
         }
     }
 }
@@ -128,7 +127,12 @@ impl Platform for WieCliPlatform {
         let midi_out = (|| {
             let midi_out = MidiOutput::new("wie_cli")?;
             let midi_ports = midi_out.ports();
-            let out_port = midi_ports.last().ok_or_else(|| anyhow::anyhow!("No MIDI output port"))?;
+            let out_port_index = select_midi_output_port(&midi_out, &midi_ports).ok_or_else(|| anyhow::anyhow!("No MIDI output port"))?;
+            let out_port = &midi_ports[out_port_index];
+
+            if let Ok(port_name) = midi_out.port_name(out_port) {
+                tracing::info!("Using MIDI output: {port_name}");
+            }
 
             Ok::<_, Box<dyn Error>>(midi_out.connect(out_port, "wie_cli")?)
         })()
@@ -158,6 +162,30 @@ impl Platform for WieCliPlatform {
             tracing::debug!("Failed to queue gamepad vibration: {err}");
         }
     }
+}
+
+fn select_midi_output_port(midi_out: &MidiOutput, midi_ports: &[MidiOutputPort]) -> Option<usize> {
+    select_midi_output_port_by_name(midi_ports.iter().map(|port| midi_out.port_name(port).unwrap_or_default()))
+}
+
+fn select_midi_output_port_by_name<I, S>(port_names: I) -> Option<usize>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut has_port = false;
+    for (index, port_name) in port_names.into_iter().enumerate() {
+        has_port = true;
+        if is_virtual_midi_synth_port(port_name.as_ref()) {
+            return Some(index);
+        }
+    }
+
+    has_port.then_some(0)
+}
+
+fn is_virtual_midi_synth_port(port_name: &str) -> bool {
+    port_name.to_ascii_lowercase().contains("virtualmidisynth")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -413,5 +441,31 @@ fn handle_gamepad_event(
                 emulator.handle_event(Event::Keyup(keycode));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_midi_output_port_by_name;
+
+    #[test]
+    fn midi_output_prefers_virtual_midi_synth() {
+        let ports = ["Microsoft GS Wavetable Synth", "VirtualMIDISynth #1", "External MIDI"];
+
+        assert_eq!(select_midi_output_port_by_name(ports), Some(1));
+    }
+
+    #[test]
+    fn midi_output_falls_back_to_first_system_port() {
+        let ports = ["Microsoft GS Wavetable Synth", "External MIDI"];
+
+        assert_eq!(select_midi_output_port_by_name(ports), Some(0));
+    }
+
+    #[test]
+    fn midi_output_returns_none_without_ports() {
+        let ports: [&str; 0] = [];
+
+        assert_eq!(select_midi_output_port_by_name(ports), None);
     }
 }

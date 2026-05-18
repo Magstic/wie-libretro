@@ -18,10 +18,14 @@ impl SmafPlayer {
             methods: vec![
                 JavaMethodProto::new("<init>", "(Ljava/io/InputStream;)V", Self::init, Default::default()),
                 JavaMethodProto::new("start", "()V", Self::start, Default::default()),
+                JavaMethodProto::new("setLoopCount", "(I)V", Self::set_loop_count, Default::default()),
                 JavaMethodProto::new("stop", "()V", Self::stop, Default::default()),
                 JavaMethodProto::new("close", "()V", Self::close, Default::default()),
             ],
-            fields: vec![JavaFieldProto::new("audioHandle", "I", Default::default())],
+            fields: vec![
+                JavaFieldProto::new("audioHandle", "I", Default::default()),
+                JavaFieldProto::new("loopCount", "I", Default::default()),
+            ],
             access_flags: Default::default(),
         }
     }
@@ -35,6 +39,7 @@ impl SmafPlayer {
         let audio_handle = context.system().audio().load_smaf(&data).unwrap();
 
         jvm.put_field(&mut this, "audioHandle", "I", audio_handle as i32).await?;
+        jvm.put_field(&mut this, "loopCount", "I", 1).await?;
 
         Ok(())
     }
@@ -43,10 +48,19 @@ impl SmafPlayer {
         tracing::debug!("net.wie.SmafPlayer::start({this:?})");
 
         let audio_handle: i32 = jvm.get_field(&this, "audioHandle", "I").await?;
+        let loop_count: i32 = jvm.get_field(&this, "loopCount", "I").await?;
 
         let system = context.system();
 
-        system.audio().play(system, audio_handle as u32).unwrap();
+        system.audio().play_with_loop_count(system, audio_handle as u32, loop_count).unwrap();
+
+        Ok(())
+    }
+
+    async fn set_loop_count(jvm: &Jvm, _context: &mut WieJvmContext, mut this: ClassInstanceRef<Self>, loop_count: i32) -> Result<()> {
+        tracing::debug!("net.wie.SmafPlayer::setLoopCount({this:?}, {loop_count})");
+
+        jvm.put_field(&mut this, "loopCount", "I", loop_count).await?;
 
         Ok(())
     }

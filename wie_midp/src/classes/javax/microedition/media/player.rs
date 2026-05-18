@@ -16,6 +16,7 @@ impl Player {
             interfaces: vec![],
             methods: vec![
                 JavaMethodProto::new_abstract("start", "()V", Default::default()),
+                JavaMethodProto::new_abstract("setLoopCount", "(I)V", Default::default()),
                 JavaMethodProto::new_abstract("stop", "()V", Default::default()),
                 JavaMethodProto::new_abstract("close", "()V", Default::default()),
             ],
