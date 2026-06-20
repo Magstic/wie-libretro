@@ -290,6 +290,17 @@ where
         T::to_color(*bytemuck::from_bytes(&buffer[..size_of::<T::DataType>()]))
     }
 
+    fn get_pixels(&self, x: i32, y: i32, colors: &mut [Color]) {
+        let bytes_per_pixel = self.bytes_per_pixel() as usize;
+        let offset = (y as usize * self.width() as usize + x as usize) * bytes_per_pixel;
+        let mut buffer = vec![0; colors.len() * bytes_per_pixel];
+        self.raw_buffer.read(offset, &mut buffer).unwrap();
+
+        for (raw, color) in buffer.chunks_exact(bytes_per_pixel).zip(colors) {
+            *color = T::to_color(*bytemuck::from_bytes(raw));
+        }
+    }
+
     fn raw(&self) -> Cow<'_, [u8]> {
         let size = self.width() * self.height() * self.bytes_per_pixel();
         let mut buffer = vec![0; size as usize];
@@ -306,6 +317,18 @@ where
             .map(|chunk| T::to_color(*bytemuck::from_bytes(chunk)))
             .collect()
     }
+
+    fn argb8888(&self) -> Vec<u32> {
+        let buffer = self.raw();
+
+        buffer
+            .chunks_exact(size_of::<T::DataType>())
+            .map(|chunk| {
+                let color = T::to_color(*bytemuck::from_bytes(chunk));
+                ((color.a as u32) << 24) | ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
+            })
+            .collect()
+    }
 }
 
 impl<T> ImageBuffer for JavaImageBuffer<T>
@@ -313,7 +336,7 @@ where
     T: PixelType,
 {
     fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
-        if x > self.width || y > self.height || x < 0 || y < 0 {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return;
         }
 
@@ -325,18 +348,32 @@ where
         self.raw_buffer.write(offset as _, raw_bytes).unwrap();
     }
 
-    fn put_pixels(&mut self, x: i32, y: i32, _width: u32, colors: &[Color]) {
-        if x > self.width || y > self.height || x < 0 || y < 0 {
+    fn put_pixels(&mut self, x: i32, y: i32, width: u32, colors: &[Color]) {
+        if width == 0 {
             return;
         }
 
-        let offset = (((y as u32) * self.width() + (x as u32)) * self.bytes_per_pixel()) as usize;
+        for (row, colors) in colors.chunks(width as usize).enumerate() {
+            let destination_y = y as i64 + row as i64;
+            if destination_y < 0 || destination_y >= self.height as i64 {
+                continue;
+            }
 
-        let raw_bytes = colors
-            .iter()
-            .flat_map(|color| bytemuck::bytes_of(&T::from_color(*color)).to_vec())
-            .collect::<Vec<_>>();
+            let source_start = (-(x as i64)).max(0) as usize;
+            let source_end = colors.len().min((self.width as i64 - x as i64).max(0) as usize);
+            if source_start >= source_end {
+                continue;
+            }
 
-        self.raw_buffer.write(offset as _, &raw_bytes).unwrap();
+            let bytes_per_pixel = self.bytes_per_pixel() as usize;
+            let destination_x = x as i64 + source_start as i64;
+            let offset = (destination_y as usize * self.width() as usize + destination_x as usize) * bytes_per_pixel;
+            let mut raw_bytes = Vec::with_capacity((source_end - source_start) * bytes_per_pixel);
+            for color in &colors[source_start..source_end] {
+                raw_bytes.extend_from_slice(bytemuck::bytes_of(&T::from_color(*color)));
+            }
+
+            self.raw_buffer.write(offset, &raw_bytes).unwrap();
+        }
     }
 }

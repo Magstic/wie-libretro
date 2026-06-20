@@ -1,4 +1,4 @@
-use alloc::format;
+use alloc::{format, vec::Vec};
 use core::mem::size_of;
 
 use elf::{ElfBytes, endian::AnyEndian};
@@ -139,6 +139,7 @@ fn load_executable(core: &mut ArmCore, data: &[u8]) -> Result<u32> {
         .map_err(|x| WieError::FatalError(format!("Failed to read ELF section headers: {x}")))?;
     let shdrs = shdrs_opt.ok_or_else(|| WieError::FatalError("ELF is missing section headers".into()))?;
     let strtab = strtab_opt.ok_or_else(|| WieError::FatalError("ELF is missing section name string table".into()))?;
+    let mut executable_ranges = Vec::new();
 
     for shdr in shdrs {
         let section_name = strtab
@@ -154,8 +155,13 @@ fn load_executable(core: &mut ArmCore, data: &[u8]) -> Result<u32> {
                 .0;
 
             core.load(data, shdr.sh_addr as u32, shdr.sh_size as usize)?;
+            if shdr.sh_flags & elf::abi::SHF_EXECINSTR as u64 != 0 {
+                executable_ranges.push((shdr.sh_addr as u32, shdr.sh_size as u32));
+            }
         }
     }
+
+    wie_core_arm::install_binary_patches(core, data, &executable_ranges)?;
 
     tracing::debug!("Entrypoint: {:#x}", elf.ehdr.e_entry);
 

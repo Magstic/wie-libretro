@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, format};
-use core::{array, cell::RefCell};
+use core::{array, mem::size_of};
 
 use arm32_cpu::{Cpu, Memory, Mode, reg};
 
@@ -136,14 +136,17 @@ impl ArmRegister {
 const TOTAL_MEMORY: u64 = 0x100000000;
 const PAGE_SIZE: usize = 0x10000;
 const PAGE_MASK: u32 = (PAGE_SIZE - 1) as _;
+const PAGE_COUNT: usize = (TOTAL_MEMORY / PAGE_SIZE as u64) as usize;
 
 struct EmulatedMemory {
-    pages: [Option<Box<[u8; PAGE_SIZE]>>; (TOTAL_MEMORY / PAGE_SIZE as u64) as usize],
+    mapped: [bool; PAGE_COUNT],
+    pages: [Option<Box<[u8; PAGE_SIZE]>>; PAGE_COUNT],
 }
 
 impl EmulatedMemory {
     fn new() -> Self {
         Self {
+            mapped: [false; PAGE_COUNT],
             pages: array::from_fn(|_| None),
         }
     }
@@ -153,15 +156,31 @@ impl EmulatedMemory {
     }
 
     fn map(&mut self, address: u32, size: usize) {
-        let page_start = address & !PAGE_MASK;
-        let page_end = (address + size as u32 + PAGE_MASK) & !PAGE_MASK;
+        let Some(page_range) = Self::page_range(address, size) else {
+            debug_assert!(false, "invalid memory mapping: address={address:#x}, size={size:#x}");
+            return;
+        };
 
-        for page in (page_start..page_end).step_by(PAGE_SIZE) {
-            let page_data = &mut self.pages[page as usize / PAGE_SIZE];
-            if page_data.is_none() {
-                *page_data = Some(Box::new([0; PAGE_SIZE]));
-            }
+        for page_index in page_range {
+            self.mapped[page_index] = true;
         }
+    }
+
+    fn page_range(address: u32, size: usize) -> Option<core::ops::Range<usize>> {
+        let start = address as u64;
+        if size == 0 {
+            let page = start as usize / PAGE_SIZE;
+            return Some(page..page);
+        }
+
+        let end = start.checked_add(size as u64)?;
+        if end > TOTAL_MEMORY {
+            return None;
+        }
+
+        let first_page = start as usize / PAGE_SIZE;
+        let page_end = end.div_ceil(PAGE_SIZE as u64) as usize;
+        Some(first_page..page_end)
     }
 
     fn read_range(&self, address: u32, size: usize, result: &mut [u8]) -> Result<usize> {
@@ -170,15 +189,22 @@ impl EmulatedMemory {
 
         while remaining_size > 0 {
             let page_address = current_address & !PAGE_MASK;
-            let page_data = self.pages[page_address as usize / PAGE_SIZE]
-                .as_ref()
-                .ok_or(WieError::InvalidMemoryAccess(current_address))?;
+            let page_index = page_address as usize / PAGE_SIZE;
+            if !self.mapped[page_index] {
+                return Err(WieError::InvalidMemoryAccess(current_address));
+            }
+
             let offset = (current_address - page_address) as usize;
             let available_bytes = (PAGE_SIZE - offset).min(remaining_size);
+            let destination = &mut result[size - remaining_size..size - remaining_size + available_bytes];
 
-            result[size - remaining_size..size - remaining_size + available_bytes].copy_from_slice(&page_data[offset..offset + available_bytes]);
+            if let Some(page_data) = self.pages[page_index].as_ref() {
+                destination.copy_from_slice(&page_data[offset..offset + available_bytes]);
+            } else {
+                destination.fill(0);
+            }
             remaining_size -= available_bytes;
-            current_address += available_bytes as u32;
+            current_address = current_address.wrapping_add(available_bytes as u32);
         }
 
         Ok(size)
@@ -190,151 +216,133 @@ impl EmulatedMemory {
 
         while data_index < data.len() {
             let page_address = current_address & !PAGE_MASK;
-            let page_data = self.pages[page_address as usize / PAGE_SIZE]
-                .as_mut()
-                .ok_or(WieError::InvalidMemoryAccess(current_address))?;
+            let page_index = page_address as usize / PAGE_SIZE;
+            if !self.mapped[page_index] {
+                return Err(WieError::InvalidMemoryAccess(current_address));
+            }
+
+            let page_data = self.pages[page_index].get_or_insert_with(|| Box::new([0; PAGE_SIZE]));
             let offset = (current_address - page_address) as usize;
             let available_bytes = (PAGE_SIZE - offset).min(data.len() - data_index);
 
             page_data[offset..offset + available_bytes].copy_from_slice(&data[data_index..data_index + available_bytes]);
             data_index += available_bytes;
-            current_address += available_bytes as u32;
+            current_address = current_address.wrapping_add(available_bytes as u32);
         }
 
         Ok(())
     }
 
     fn is_mapped(&self, address: u32, size: usize) -> bool {
-        let page_start = address & !PAGE_MASK;
-        let page_end = (address + size as u32 + PAGE_MASK) & !PAGE_MASK;
-
-        if self.pages[page_start as usize / PAGE_SIZE].is_none() {
-            return false;
-        }
-
-        for page in (page_start..page_end).step_by(PAGE_SIZE) {
-            if self.pages[page as usize / PAGE_SIZE].is_none() {
-                return false;
-            }
-        }
-
-        true
+        Self::page_range(address, size).is_some_and(|page_range| page_range.into_iter().all(|page_index| self.mapped[page_index]))
     }
 }
 
 struct Arm32CpuMemory<'a> {
     emulated_memory: &'a mut EmulatedMemory,
-    memory_error: RefCell<Option<u32>>,
+    memory_error: Option<u32>,
 }
 
 impl<'a> Arm32CpuMemory<'a> {
     fn new(emulated_memory: &'a mut EmulatedMemory) -> Self {
         Self {
             emulated_memory,
-            memory_error: RefCell::new(None),
+            memory_error: None,
         }
     }
 
     fn memory_error(&self) -> Option<u32> {
-        *self.memory_error.borrow()
+        self.memory_error
     }
 
-    fn get_page(&mut self, addr: u32) -> Option<&mut [u8; PAGE_SIZE]> {
-        let page_address = addr & !PAGE_MASK;
-        let page_data = self.emulated_memory.pages[page_address as usize / PAGE_SIZE].as_mut();
-
-        if let Some(x) = page_data {
-            Some(x)
-        } else {
-            *self.memory_error.borrow_mut() = Some(addr);
-            None
+    fn read_page(&mut self, addr: u32) -> Option<Option<&[u8; PAGE_SIZE]>> {
+        let page_index = addr as usize / PAGE_SIZE;
+        if !self.emulated_memory.mapped[page_index] {
+            self.memory_error = Some(addr);
+            return None;
         }
+
+        Some(self.emulated_memory.pages[page_index].as_deref())
+    }
+
+    fn write_page(&mut self, addr: u32) -> Option<&mut [u8; PAGE_SIZE]> {
+        let page_index = addr as usize / PAGE_SIZE;
+        if !self.emulated_memory.mapped[page_index] {
+            self.memory_error = Some(addr);
+            return None;
+        }
+
+        Some(self.emulated_memory.pages[page_index].get_or_insert_with(|| Box::new([0; PAGE_SIZE])))
     }
 }
 
 impl Memory for Arm32CpuMemory<'_> {
     fn r8(&mut self, addr: u32) -> u8 {
-        let offset = addr & PAGE_MASK;
-
-        let page = self.get_page(addr);
-        if page.is_none() {
-            return 0;
-        }
-
-        let data = page.unwrap();
-
-        data[offset as usize]
+        let offset = (addr & PAGE_MASK) as usize;
+        self.read_page(addr).flatten().map_or(0, |page| page[offset])
     }
 
     fn r16(&mut self, addr: u32) -> u16 {
-        let offset = addr & PAGE_MASK;
-
-        let page = self.get_page(addr);
-        if page.is_none() {
-            return 0;
+        let offset = (addr & PAGE_MASK) as usize;
+        if offset + size_of::<u16>() <= PAGE_SIZE {
+            return self
+                .read_page(addr)
+                .flatten()
+                .map_or(0, |page| u16::from_le_bytes([page[offset], page[offset + 1]]));
         }
 
-        let data = page.unwrap();
-
-        (data[offset as usize] as u16) | ((data[offset as usize + 1] as u16) << 8)
+        u16::from_le_bytes([self.r8(addr), self.r8(addr.wrapping_add(1))])
     }
 
     fn r32(&mut self, addr: u32) -> u32 {
-        let offset = addr & PAGE_MASK;
-
-        let page = self.get_page(addr);
-        if page.is_none() {
-            return 0;
+        let offset = (addr & PAGE_MASK) as usize;
+        if offset + size_of::<u32>() <= PAGE_SIZE {
+            return self.read_page(addr).flatten().map_or(0, |page| {
+                u32::from_le_bytes([page[offset], page[offset + 1], page[offset + 2], page[offset + 3]])
+            });
         }
 
-        let data = page.unwrap();
-        (data[offset as usize] as u32)
-            | ((data[offset as usize + 1] as u32) << 8)
-            | ((data[offset as usize + 2] as u32) << 16)
-            | ((data[offset as usize + 3] as u32) << 24)
+        u32::from_le_bytes([
+            self.r8(addr),
+            self.r8(addr.wrapping_add(1)),
+            self.r8(addr.wrapping_add(2)),
+            self.r8(addr.wrapping_add(3)),
+        ])
     }
 
     fn w8(&mut self, addr: u32, val: u8) {
-        let offset = addr & PAGE_MASK;
-
-        let page = self.get_page(addr);
-        if page.is_none() {
-            return;
+        let offset = (addr & PAGE_MASK) as usize;
+        if let Some(page) = self.write_page(addr) {
+            page[offset] = val;
         }
-
-        let data = page.unwrap();
-
-        data[offset as usize] = val;
     }
 
     fn w16(&mut self, addr: u32, val: u16) {
-        let offset = addr & PAGE_MASK;
-
-        let page = self.get_page(addr);
-        if page.is_none() {
+        let offset = (addr & PAGE_MASK) as usize;
+        if offset + size_of::<u16>() > PAGE_SIZE {
+            let bytes = val.to_le_bytes();
+            self.w8(addr, bytes[0]);
+            self.w8(addr.wrapping_add(1), bytes[1]);
             return;
         }
 
-        let data = page.unwrap();
-
-        data[offset as usize] = val as u8;
-        data[offset as usize + 1] = (val >> 8) as u8;
+        if let Some(page) = self.write_page(addr) {
+            page[offset..offset + size_of::<u16>()].copy_from_slice(&val.to_le_bytes());
+        }
     }
 
     fn w32(&mut self, addr: u32, val: u32) {
-        let offset = addr & PAGE_MASK;
-
-        let page = self.get_page(addr);
-        if page.is_none() {
+        let offset = (addr & PAGE_MASK) as usize;
+        if offset + size_of::<u32>() > PAGE_SIZE {
+            for (index, byte) in val.to_le_bytes().into_iter().enumerate() {
+                self.w8(addr.wrapping_add(index as u32), byte);
+            }
             return;
         }
 
-        let data = page.unwrap();
-
-        data[offset as usize] = val as u8;
-        data[offset as usize + 1] = (val >> 8) as u8;
-        data[offset as usize + 2] = (val >> 16) as u8;
-        data[offset as usize + 3] = (val >> 24) as u8;
+        if let Some(page) = self.write_page(addr) {
+            page[offset..offset + size_of::<u32>()].copy_from_slice(&val.to_le_bytes());
+        }
     }
 }
 
@@ -351,6 +359,11 @@ mod tests {
         memory.map(0x10000, 0x1000);
         memory.map(0x11000, 0x1000);
         memory.map(0x20000, 0x10000);
+
+        let mut zeroes = [0xff; 16];
+        memory.read_range(0x20000, zeroes.len(), &mut zeroes).unwrap();
+        assert_eq!(zeroes, [0; 16]);
+        assert!(memory.pages[0x20000 / super::PAGE_SIZE].is_none());
 
         memory.write_range(0x10000, &[123; 0x1000]).unwrap();
 
@@ -385,6 +398,29 @@ mod tests {
         arm32cpu_memory.w32(0x10000, 0x12345678);
         let r32 = arm32cpu_memory.r32(0x10000);
         assert_eq!(r32, 0x12345678);
+    }
+
+    #[test]
+    fn test_instruction_memory_access_across_page_boundary() {
+        let mut memory = EmulatedMemory::new();
+        memory.map(0x10000, 0x20000);
+
+        let mut arm32cpu_memory = memory.as_arm32cpu_memory();
+        arm32cpu_memory.w32(0x1fffe, 0x12345678);
+
+        assert_eq!(arm32cpu_memory.r16(0x1ffff), 0x3456);
+        assert_eq!(arm32cpu_memory.r32(0x1fffe), 0x12345678);
+        assert_eq!(arm32cpu_memory.memory_error(), None);
+    }
+
+    #[test]
+    fn test_large_mapping_allocates_pages_on_first_write() {
+        let mut memory = EmulatedMemory::new();
+        memory.map(0x40000000, 0x10000000);
+
+        assert_eq!(memory.pages.iter().filter(|page| page.is_some()).count(), 0);
+        memory.write_range(0x48000000, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(memory.pages.iter().filter(|page| page.is_some()).count(), 1);
     }
 
     #[test]

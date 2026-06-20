@@ -1,6 +1,6 @@
 use alloc::{collections::BTreeMap, format, string::ToString, sync::Arc, vec::Vec};
 
-use wie_util::{ByteWrite, Result, WieError, read_generic};
+use wie_util::{ByteRead, ByteWrite, Result, WieError, read_generic};
 
 use super::{Entry, PatternToken, scan_pattern};
 use crate::{ArmCore, engine::ArmRegister, function::JumpTo, stdlib};
@@ -34,6 +34,20 @@ pub enum HookKind {
     /// rewritten so it equals what the loop would have left there (i.e.,
     /// `original - bytes`), then the dispatcher jumps to `exit_pc`.
     RegInlineCopy(RegInlineCopy),
+    /// Replaces a compiler-generated RGB565 row fill whose destination is R3,
+    /// color is R5, current pixel index is R2, and row width is R4.
+    RegInlineFill16Regs(RegInlineFill16Regs),
+    /// Replaces a compiler-generated RGB565 row fill whose destination is R1,
+    /// color is IP, current pixel index is R3, and row width is `[SP]`.
+    /// R1/R3/R5 are updated to the values the original loop leaves behind.
+    RegInlineFill16(RegInlineFill16),
+    /// RGB565 quarter blend: `((dst & R6) >> 2) + [SP+0x10] + [SP+0x18]`.
+    RegInlineBlend16Quarter(RegInlineRaster16),
+    /// RGB565 half blend: `((dst & R6) >> 1) + [SP+0x20]`.
+    RegInlineBlend16Half(RegInlineRaster16),
+    /// RGB565 mixed blend using masks at SP+0x14/SP+0x0c and a source
+    /// contribution at SP+0x1c.
+    RegInlineBlend16Mixed(RegInlineRaster16),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +67,21 @@ pub struct RegInlineCopy {
     dst: ArmRegister,
     count: ArmRegister,
     count_offset: i32,
+    exit_pc: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RegInlineFill16 {
+    exit_pc: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RegInlineFill16Regs {
+    exit_pc: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RegInlineRaster16 {
     exit_pc: u32,
 }
 
@@ -85,6 +114,13 @@ pub enum PatternHookKind {
     RegInlineCopy {
         count_offset: i32,
     },
+    /// Register layout is fixed by the matched compiler loop; `exit_pc` is
+    /// derived from `match_addr + pattern.len()`.
+    RegInlineFill16,
+    RegInlineFill16Regs,
+    RegInlineBlend16Quarter,
+    RegInlineBlend16Half,
+    RegInlineBlend16Mixed,
 }
 
 /// Expand static + pattern hooks into a single `Vec<Hook>` whose PCs are final
@@ -170,6 +206,21 @@ pub fn resolve_hooks(core: &mut ArmCore, entry: &Entry, scan_ranges: &[(u32, u32
                         exit_pc,
                     })
                 }
+                PatternHookKind::RegInlineFill16 => HookKind::RegInlineFill16(RegInlineFill16 {
+                    exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
+                }),
+                PatternHookKind::RegInlineFill16Regs => HookKind::RegInlineFill16Regs(RegInlineFill16Regs {
+                    exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
+                }),
+                PatternHookKind::RegInlineBlend16Quarter => HookKind::RegInlineBlend16Quarter(RegInlineRaster16 {
+                    exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
+                }),
+                PatternHookKind::RegInlineBlend16Half => HookKind::RegInlineBlend16Half(RegInlineRaster16 {
+                    exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
+                }),
+                PatternHookKind::RegInlineBlend16Mixed => HookKind::RegInlineBlend16Mixed(RegInlineRaster16 {
+                    exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
+                }),
             };
             let pc = match_addr | 1;
             if installed.iter().any(|h| h.pc == pc) {
@@ -330,6 +381,184 @@ async fn handle_binary_patch_svc(core: &mut ArmCore, registry: &mut Registry) ->
             inner.engine.reg_write(spec.src, src.wrapping_add(count));
             inner.engine.reg_write(spec.dst, dst.wrapping_add(count));
             inner.engine.reg_write(spec.count, count_initial.wrapping_sub(count));
+            Ok(JumpTo(spec.exit_pc))
+        }
+        HookKind::RegInlineFill16(spec) => {
+            let (dst, color, current, sp) = {
+                let inner = core.inner.lock();
+                (
+                    inner.engine.reg_read(ArmRegister::R1),
+                    inner.engine.reg_read(ArmRegister::IP) as u16,
+                    inner.engine.reg_read(ArmRegister::R3),
+                    inner.engine.reg_read(ArmRegister::SP),
+                )
+            };
+            let width: u32 = read_generic(core, sp)?;
+            let remaining = width.saturating_sub(current);
+            let byte_len = remaining
+                .checked_mul(2)
+                .ok_or_else(|| WieError::FatalError(format!("inline_fill16 length overflow: {remaining:#x}")))?;
+            let color_bytes = color.to_le_bytes();
+            let mut data = alloc::vec![0u8; byte_len as usize];
+            for pixel in data.chunks_exact_mut(2) {
+                pixel.copy_from_slice(&color_bytes);
+            }
+            core.write_bytes(dst, &data)?;
+
+            tracing::trace!(
+                "hook reg_inline_fill16(dst={dst:#x}, color={color:#x}, current={current:#x}, width={width:#x}, exit={:#x})",
+                spec.exit_pc
+            );
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R1, dst.wrapping_add(byte_len));
+            inner.engine.reg_write(ArmRegister::R3, width);
+            inner.engine.reg_write(ArmRegister::R5, width);
+            Ok(JumpTo(spec.exit_pc))
+        }
+        HookKind::RegInlineFill16Regs(spec) => {
+            let (dst, color, current, width) = {
+                let inner = core.inner.lock();
+                (
+                    inner.engine.reg_read(ArmRegister::R3),
+                    inner.engine.reg_read(ArmRegister::R5) as u16,
+                    inner.engine.reg_read(ArmRegister::R2),
+                    inner.engine.reg_read(ArmRegister::R4),
+                )
+            };
+            let remaining = width.saturating_sub(current);
+            let byte_len = remaining
+                .checked_mul(2)
+                .ok_or_else(|| WieError::FatalError(format!("inline_fill16_regs length overflow: {remaining:#x}")))?;
+            let color_bytes = color.to_le_bytes();
+            let mut data = alloc::vec![0u8; byte_len as usize];
+            for pixel in data.chunks_exact_mut(2) {
+                pixel.copy_from_slice(&color_bytes);
+            }
+            core.write_bytes(dst, &data)?;
+
+            tracing::trace!(
+                "hook reg_inline_fill16_regs(dst={dst:#x}, color={color:#x}, current={current:#x}, width={width:#x}, exit={:#x})",
+                spec.exit_pc
+            );
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R3, dst.wrapping_add(byte_len));
+            inner.engine.reg_write(ArmRegister::R2, width);
+            Ok(JumpTo(spec.exit_pc))
+        }
+        HookKind::RegInlineBlend16Quarter(spec) => {
+            let (dst, current, mask, sp) = {
+                let inner = core.inner.lock();
+                (
+                    inner.engine.reg_read(ArmRegister::R2),
+                    inner.engine.reg_read(ArmRegister::R1),
+                    inner.engine.reg_read(ArmRegister::R6) as u16,
+                    inner.engine.reg_read(ArmRegister::SP),
+                )
+            };
+            let width: u32 = read_generic(core, sp.wrapping_add(4))?;
+            let contribution1: u32 = read_generic(core, sp.wrapping_add(0x10))?;
+            let contribution2: u32 = read_generic(core, sp.wrapping_add(0x18))?;
+            let remaining = width.saturating_sub(current);
+            let byte_len = remaining
+                .checked_mul(2)
+                .ok_or_else(|| WieError::FatalError(format!("inline_blend16_quarter length overflow: {remaining:#x}")))?;
+            let mut data = alloc::vec![0u8; byte_len as usize];
+            core.read_bytes(dst, &mut data)?;
+            for pixel in data.chunks_exact_mut(2) {
+                let old = u16::from_le_bytes([pixel[0], pixel[1]]);
+                let blended = (((old & mask) >> 2) as u32).wrapping_add(contribution1).wrapping_add(contribution2) as u16;
+                pixel.copy_from_slice(&blended.to_le_bytes());
+            }
+            core.write_bytes(dst, &data)?;
+
+            tracing::trace!(
+                "hook reg_inline_blend16_quarter(dst={dst:#x}, current={current:#x}, width={width:#x}, exit={:#x})",
+                spec.exit_pc
+            );
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R2, dst.wrapping_add(byte_len));
+            inner.engine.reg_write(ArmRegister::R1, width);
+            inner.engine.reg_write(ArmRegister::R3, width);
+            inner.engine.reg_write(ArmRegister::R5, contribution2);
+            Ok(JumpTo(spec.exit_pc))
+        }
+        HookKind::RegInlineBlend16Half(spec) => {
+            let (dst, current, mask, sp) = {
+                let inner = core.inner.lock();
+                (
+                    inner.engine.reg_read(ArmRegister::R2),
+                    inner.engine.reg_read(ArmRegister::R1),
+                    inner.engine.reg_read(ArmRegister::R6) as u16,
+                    inner.engine.reg_read(ArmRegister::SP),
+                )
+            };
+            let width: u32 = read_generic(core, sp.wrapping_add(4))?;
+            let contribution: u32 = read_generic(core, sp.wrapping_add(0x20))?;
+            let remaining = width.saturating_sub(current);
+            let byte_len = remaining
+                .checked_mul(2)
+                .ok_or_else(|| WieError::FatalError(format!("inline_blend16_half length overflow: {remaining:#x}")))?;
+            let mut data = alloc::vec![0u8; byte_len as usize];
+            core.read_bytes(dst, &mut data)?;
+            for pixel in data.chunks_exact_mut(2) {
+                let old = u16::from_le_bytes([pixel[0], pixel[1]]);
+                let blended = (((old & mask) >> 1) as u32).wrapping_add(contribution) as u16;
+                pixel.copy_from_slice(&blended.to_le_bytes());
+            }
+            core.write_bytes(dst, &data)?;
+
+            tracing::trace!(
+                "hook reg_inline_blend16_half(dst={dst:#x}, current={current:#x}, width={width:#x}, exit={:#x})",
+                spec.exit_pc
+            );
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R2, dst.wrapping_add(byte_len));
+            inner.engine.reg_write(ArmRegister::R1, width);
+            inner.engine.reg_write(ArmRegister::R3, width);
+            inner.engine.reg_write(ArmRegister::R5, contribution);
+            Ok(JumpTo(spec.exit_pc))
+        }
+        HookKind::RegInlineBlend16Mixed(spec) => {
+            let (dst, current, width, sp) = {
+                let inner = core.inner.lock();
+                (
+                    inner.engine.reg_read(ArmRegister::R1),
+                    inner.engine.reg_read(ArmRegister::R4),
+                    inner.engine.reg_read(ArmRegister::R6),
+                    inner.engine.reg_read(ArmRegister::SP),
+                )
+            };
+            let quarter_mask: u32 = read_generic(core, sp.wrapping_add(0x14))?;
+            let half_mask: u32 = read_generic(core, sp.wrapping_add(0x0c))?;
+            let contribution: u32 = read_generic(core, sp.wrapping_add(0x1c))?;
+            let remaining = width.saturating_sub(current);
+            let byte_len = remaining
+                .checked_mul(2)
+                .ok_or_else(|| WieError::FatalError(format!("inline_blend16_mixed length overflow: {remaining:#x}")))?;
+            let mut data = alloc::vec![0u8; byte_len as usize];
+            core.read_bytes(dst, &mut data)?;
+            let mut last_blended = core.inner.lock().engine.reg_read(ArmRegister::R2) as u16;
+            for pixel in data.chunks_exact_mut(2) {
+                let old = u16::from_le_bytes([pixel[0], pixel[1]]) as u32;
+                last_blended = (((old & quarter_mask) >> 2)
+                    .wrapping_add((old & half_mask) >> 1)
+                    .wrapping_add(contribution)) as u16;
+                pixel.copy_from_slice(&last_blended.to_le_bytes());
+            }
+            core.write_bytes(dst, &data)?;
+            if remaining != 0 {
+                core.write_bytes(sp, &(last_blended as u32).to_le_bytes())?;
+            }
+
+            tracing::trace!(
+                "hook reg_inline_blend16_mixed(dst={dst:#x}, current={current:#x}, width={width:#x}, exit={:#x})",
+                spec.exit_pc
+            );
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R1, dst.wrapping_add(byte_len));
+            inner.engine.reg_write(ArmRegister::R4, width);
+            inner.engine.reg_write(ArmRegister::R2, last_blended as u32);
+            inner.engine.reg_write(ArmRegister::R3, contribution);
             Ok(JumpTo(spec.exit_pc))
         }
     }
@@ -571,6 +800,190 @@ mod tests {
         assert_eq!(u32::from_le_bytes(slot), 0);
 
         assert_eq!(core.inner.lock().engine.reg_read(ArmRegister::PC), 0x10400);
+        Ok(())
+    }
+
+    #[futures_test::test]
+    async fn reg_inline_fill16_dispatch_fills_remaining_pixels_and_updates_loop_registers() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        core.map(0x10000, 0x2000)?;
+
+        let dst = 0x10000u32;
+        let sp = 0x11000u32;
+        let width = 4u32;
+        core.write_bytes(dst, &[0x99; 8])?;
+        core.write_bytes(sp, &width.to_le_bytes())?;
+
+        let hook_pc = 0x10401u32;
+        let exit_pc = 0x1040fu32;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R1, dst + 2);
+            inner.engine.reg_write(ArmRegister::R3, 1);
+            inner.engine.reg_write(ArmRegister::IP, 0x1234);
+            inner.engine.reg_write(ArmRegister::SP, sp);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::RegInlineFill16(RegInlineFill16 { exit_pc }));
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let mut out = [0u8; 8];
+        core.read_bytes(dst, &mut out)?;
+        assert_eq!(out, [0x99, 0x99, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12]);
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R1), dst + 8);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R3), width);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R5), width);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), exit_pc & !1);
+        Ok(())
+    }
+
+    #[futures_test::test]
+    async fn reg_inline_fill16_regs_dispatch_preserves_register_loop_result() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        core.map(0x10000, 0x1000)?;
+
+        let dst = 0x10000u32;
+        let hook_pc = 0x10401u32;
+        let exit_pc = 0x1040bu32;
+        core.write_bytes(dst, &[0x99; 8])?;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R2, 1);
+            inner.engine.reg_write(ArmRegister::R3, dst + 2);
+            inner.engine.reg_write(ArmRegister::R4, 4);
+            inner.engine.reg_write(ArmRegister::R5, 0x5678);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::RegInlineFill16Regs(RegInlineFill16Regs { exit_pc }));
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let mut out = [0u8; 8];
+        core.read_bytes(dst, &mut out)?;
+        assert_eq!(out, [0x99, 0x99, 0x78, 0x56, 0x78, 0x56, 0x78, 0x56]);
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R2), 4);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R3), dst + 8);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), exit_pc & !1);
+        Ok(())
+    }
+
+    #[futures_test::test]
+    async fn reg_inline_blend16_quarter_dispatch_preserves_formula_and_registers() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        core.map(0x10000, 0x2000)?;
+
+        let dst = 0x10000u32;
+        let sp = 0x11000u32;
+        let hook_pc = 0x10401u32;
+        let exit_pc = 0x1041du32;
+        core.write_bytes(dst, &[0xff, 0xff, 0x34, 0x12, 0x00, 0x04])?;
+        core.write_bytes(sp + 4, &3u32.to_le_bytes())?;
+        core.write_bytes(sp + 0x10, &0x100u32.to_le_bytes())?;
+        core.write_bytes(sp + 0x18, &0x20u32.to_le_bytes())?;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R1, 1);
+            inner.engine.reg_write(ArmRegister::R2, dst + 2);
+            inner.engine.reg_write(ArmRegister::R6, 0xf7de);
+            inner.engine.reg_write(ArmRegister::SP, sp);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::RegInlineBlend16Quarter(RegInlineRaster16 { exit_pc }));
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let mut out = [0u8; 6];
+        core.read_bytes(dst, &mut out)?;
+        assert_eq!(out, [0xff, 0xff, 0xa5, 0x05, 0x20, 0x02]);
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R1), 3);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R2), dst + 6);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R3), 3);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R5), 0x20);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), exit_pc & !1);
+        Ok(())
+    }
+
+    #[futures_test::test]
+    async fn reg_inline_blend16_half_dispatch_preserves_formula_and_registers() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        core.map(0x10000, 0x2000)?;
+
+        let dst = 0x10000u32;
+        let sp = 0x11000u32;
+        let hook_pc = 0x10401u32;
+        let exit_pc = 0x10419u32;
+        core.write_bytes(dst, &[0xff, 0xff, 0x34, 0x12])?;
+        core.write_bytes(sp + 4, &2u32.to_le_bytes())?;
+        core.write_bytes(sp + 0x20, &0x101u32.to_le_bytes())?;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R1, 0);
+            inner.engine.reg_write(ArmRegister::R2, dst);
+            inner.engine.reg_write(ArmRegister::R6, 0xf7de);
+            inner.engine.reg_write(ArmRegister::SP, sp);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::RegInlineBlend16Half(RegInlineRaster16 { exit_pc }));
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let mut out = [0u8; 4];
+        core.read_bytes(dst, &mut out)?;
+        assert_eq!(out, [0xf0, 0x7c, 0x0b, 0x0a]);
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R1), 2);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R2), dst + 4);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R3), 2);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R5), 0x101);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), exit_pc & !1);
+        Ok(())
+    }
+
+    #[futures_test::test]
+    async fn reg_inline_blend16_mixed_dispatch_preserves_formula_stack_and_registers() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        core.map(0x10000, 0x2000)?;
+
+        let dst = 0x10000u32;
+        let sp = 0x11000u32;
+        let hook_pc = 0x10401u32;
+        let exit_pc = 0x1042bu32;
+        core.write_bytes(dst, &[0xff, 0xff, 0x34, 0x12])?;
+        core.write_bytes(sp + 0x0c, &0x1863u32.to_le_bytes())?;
+        core.write_bytes(sp + 0x14, &0xe79cu32.to_le_bytes())?;
+        core.write_bytes(sp + 0x1c, &0x20u32.to_le_bytes())?;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R1, dst);
+            inner.engine.reg_write(ArmRegister::R4, 0);
+            inner.engine.reg_write(ArmRegister::R6, 2);
+            inner.engine.reg_write(ArmRegister::SP, sp);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::RegInlineBlend16Mixed(RegInlineRaster16 { exit_pc }));
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let mut out = [0u8; 4];
+        core.read_bytes(dst, &mut out)?;
+        assert_eq!(out, [0x38, 0x46, 0xb5, 0x08]);
+        let stacked: u32 = read_generic(&core, sp)?;
+        assert_eq!(stacked, 0x08b5);
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R1), dst + 4);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R2), 0x08b5);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R3), 0x20);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R4), 2);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), exit_pc & !1);
         Ok(())
     }
 

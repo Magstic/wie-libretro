@@ -34,6 +34,7 @@ use wie_j2me::J2MEEmulator;
 use wie_ktf::KtfEmulator;
 use wie_lgt::LgtEmulator;
 use wie_skt::SktEmulator;
+use wie_util::WieError;
 
 use self::{
     audio_sink::AudioSink,
@@ -50,6 +51,11 @@ struct WieCliPlatform {
     filesystem: CliFilesystem,
     vibrate_tx: Sender<(u64, u8)>,
     window: WindowHandle,
+}
+
+enum EmulatorCommand {
+    Event(Event),
+    Shutdown,
 }
 
 impl WieCliPlatform {
@@ -307,10 +313,11 @@ pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
         }
     };
     let window = WindowImpl::new(240, 320).unwrap(); // TODO hardcoded size
-    let platform = Box::new(WieCliPlatform::new(window.handle(), vibrate_tx));
+    let window_handle = window.handle();
+    let platform = Box::new(WieCliPlatform::new(window_handle.clone(), vibrate_tx));
 
     let buf = fs::read(filename)?;
-    let mut emulator: Box<dyn Emulator> = if filename.ends_with("zip") {
+    let mut emulator: Box<dyn Emulator + Send> = if filename.ends_with("zip") {
         let files = extract_zip(&buf).unwrap();
 
         if KtfEmulator::loadable_archive(&files) {
@@ -362,43 +369,71 @@ pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
         anyhow::bail!("Unknown file format");
     };
 
+    let (emulator_tx, emulator_rx) = channel();
+    let emulator_window = window_handle.clone();
+    let emulator_thread = thread::Builder::new()
+        .name("wie-emulator".into())
+        .spawn(move || -> wie_util::Result<()> {
+            loop {
+                let mut shutdown = false;
+                for command in emulator_rx.try_iter() {
+                    match command {
+                        EmulatorCommand::Event(event) => emulator.handle_event(event),
+                        EmulatorCommand::Shutdown => shutdown = true,
+                    }
+                }
+                if shutdown {
+                    return Ok(());
+                }
+
+                if let Err(error) = emulator.tick() {
+                    emulator_window.send_quit_event();
+                    return Err(error);
+                }
+            }
+        })?;
+
     let mut input_state = InputState::default();
-    window.run(move |event| {
+    let callback_tx = emulator_tx.clone();
+    let window_result = window.run(move |event| {
         match event {
             WindowCallbackEvent::Update => {
                 let now = SystemTime::now();
 
                 if let Some(gamepad) = gamepad.as_mut() {
                     for gamepad_event in gamepad.poll() {
-                        handle_gamepad_event(&mut *emulator, &gamepad_map, &mut input_state, gamepad_event);
+                        handle_gamepad_event(&callback_tx, &gamepad_map, &mut input_state, gamepad_event)?;
                     }
                 }
 
                 for keycode in input_state.repeat_due(now) {
-                    emulator.handle_event(Event::Keyrepeat(keycode));
+                    send_emulator_event(&callback_tx, Event::Keyrepeat(keycode))?;
                 }
-
-                emulator.tick()?
             }
-            WindowCallbackEvent::Redraw => emulator.handle_event(Event::Redraw),
+            WindowCallbackEvent::Redraw => send_emulator_event(&callback_tx, Event::Redraw)?,
             WindowCallbackEvent::Keydown(x) => {
                 if let Some((source, keycode)) = convert_keyboard_input(x, &keyboard_map)
                     && input_state.press(source, keycode)
                 {
-                    emulator.handle_event(Event::Keydown(keycode));
+                    send_emulator_event(&callback_tx, Event::Keydown(keycode))?;
                 }
             }
             WindowCallbackEvent::Keyup(x) => {
                 if let PhysicalKey::Code(code) = x
                     && let Some(keycode) = input_state.release(InputSource::Keyboard(code))
                 {
-                    emulator.handle_event(Event::Keyup(keycode));
+                    send_emulator_event(&callback_tx, Event::Keyup(keycode))?;
                 }
             }
         }
 
         Ok(())
-    })
+    });
+
+    let _ = emulator_tx.send(EmulatorCommand::Shutdown);
+    let emulator_result = emulator_thread.join().map_err(|_| anyhow::anyhow!("Emulator thread panicked"))?;
+    window_result?;
+    emulator_result.map_err(anyhow::Error::from)
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
@@ -418,30 +453,38 @@ fn convert_keyboard_input(key: PhysicalKey, keyboard_map: &HashMap<WinitKeyCode,
     keyboard_map.get(&code).copied().map(|keycode| (InputSource::Keyboard(code), keycode))
 }
 
+fn send_emulator_event(sender: &Sender<EmulatorCommand>, event: Event) -> wie_util::Result<()> {
+    sender
+        .send(EmulatorCommand::Event(event))
+        .map_err(|_| WieError::FatalError("Emulator thread is not running".into()))
+}
+
 fn handle_gamepad_event(
-    emulator: &mut dyn Emulator,
+    emulator_tx: &Sender<EmulatorCommand>,
     gamepad_map: &HashMap<GamepadInput, KeyCode>,
     input_state: &mut InputState,
     event: GamepadCallbackEvent,
-) {
+) -> wie_util::Result<()> {
     match event {
         GamepadCallbackEvent::Keydown { id, input } => {
             let Some(keycode) = gamepad_map.get(&input).copied() else {
-                return;
+                return Ok(());
             };
 
             let source = InputSource::Gamepad { id, input };
             if input_state.press(source, keycode) {
-                emulator.handle_event(Event::Keydown(keycode));
+                send_emulator_event(emulator_tx, Event::Keydown(keycode))?;
             }
         }
         GamepadCallbackEvent::Keyup { id, input } => {
             let source = InputSource::Gamepad { id, input };
             if let Some(keycode) = input_state.release(source) {
-                emulator.handle_event(Event::Keyup(keycode));
+                send_emulator_event(emulator_tx, Event::Keyup(keycode))?;
             }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

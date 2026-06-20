@@ -1,6 +1,11 @@
 use alloc::sync::Arc;
-use core::{fmt::Debug, fmt::Formatter, num::NonZeroU32};
-use std::{fmt, vec};
+use core::{
+    fmt::Debug,
+    fmt::Formatter,
+    num::NonZeroU32,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use std::{fmt, sync::Mutex, time::Duration, vec};
 
 use fast_image_resize::ResizeAlg;
 use fast_image_resize::{PixelType, ResizeOptions, SrcCropping};
@@ -19,7 +24,7 @@ use wie_backend::{Screen, canvas::Image};
 #[derive(Debug)]
 pub enum WindowInternalEvent {
     RequestRedraw,
-    Paint(Vec<u32>),
+    Paint,
     Quit,
 }
 
@@ -30,37 +35,54 @@ pub enum WindowCallbackEvent {
     Keyup(PhysicalKey),
 }
 
+#[derive(Clone)]
 pub struct WindowHandle {
     width: u32,
     height: u32,
     event_loop_proxy: EventLoopProxy<WindowInternalEvent>,
+    latest_frame: Arc<Mutex<Option<Vec<u32>>>>,
+    paint_event_pending: Arc<AtomicBool>,
+    redraw_event_pending: Arc<AtomicBool>,
 }
 
 impl WindowHandle {
     pub fn send_quit_event(&self) {
-        self.send_event(WindowInternalEvent::Quit).unwrap();
+        let _ = self.send_event(WindowInternalEvent::Quit);
     }
 
     fn send_event(&self, event: WindowInternalEvent) -> wie_util::Result<()> {
-        self.event_loop_proxy.send_event(event).unwrap();
-
-        Ok(())
+        self.event_loop_proxy
+            .send_event(event)
+            .map_err(|_| wie_util::WieError::FatalError("Window event loop is closed".into()))
     }
 }
 
 impl Screen for WindowHandle {
     fn request_redraw(&self) -> wie_util::Result<()> {
-        self.send_event(WindowInternalEvent::RequestRedraw)
+        if self.redraw_event_pending.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        if let Err(error) = self.send_event(WindowInternalEvent::RequestRedraw) {
+            self.redraw_event_pending.store(false, Ordering::Release);
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     fn paint(&self, image: &dyn Image) {
-        let data = image
-            .colors()
-            .iter()
-            .map(|x| ((x.a as u32) << 24) | ((x.r as u32) << 16) | ((x.g as u32) << 8) | (x.b as u32))
-            .collect::<Vec<_>>();
+        *self.latest_frame.lock().unwrap() = Some(image.argb8888());
+        if self.paint_event_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
 
-        self.send_event(WindowInternalEvent::Paint(data)).unwrap()
+        // The emulator thread can finish its current frame after the user has
+        // already closed the window. Dropping that final frame is expected;
+        // panicking here would turn an orderly shutdown into a worker failure.
+        if self.send_event(WindowInternalEvent::Paint).is_err() {
+            self.paint_event_pending.store(false, Ordering::Release);
+        }
     }
 
     fn width(&self) -> u32 {
@@ -76,13 +98,23 @@ pub struct WindowImpl {
     width: u32,
     height: u32,
     event_loop: EventLoop<WindowInternalEvent>,
+    latest_frame: Arc<Mutex<Option<Vec<u32>>>>,
+    paint_event_pending: Arc<AtomicBool>,
+    redraw_event_pending: Arc<AtomicBool>,
 }
 
 impl WindowImpl {
     pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
         let event_loop = EventLoop::<WindowInternalEvent>::with_user_event().build()?;
 
-        Ok(Self { width, height, event_loop })
+        Ok(Self {
+            width,
+            height,
+            event_loop,
+            latest_frame: Arc::new(Mutex::new(None)),
+            paint_event_pending: Arc::new(AtomicBool::new(false)),
+            redraw_event_pending: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn handle(&self) -> WindowHandle {
@@ -90,6 +122,9 @@ impl WindowImpl {
             width: self.width,
             height: self.height,
             event_loop_proxy: self.event_loop.create_proxy(),
+            latest_frame: self.latest_frame.clone(),
+            paint_event_pending: self.paint_event_pending.clone(),
+            redraw_event_pending: self.redraw_event_pending.clone(),
         }
     }
 
@@ -97,7 +132,7 @@ impl WindowImpl {
     where
         C: FnMut(WindowCallbackEvent) -> wie_util::Result<()> + 'static,
     {
-        self.event_loop.set_control_flow(ControlFlow::Poll);
+        self.event_loop.set_control_flow(ControlFlow::Wait);
 
         let orig_size = LogicalSize::new(self.width, self.height);
         let mut handler = ApplicationHandlerImpl {
@@ -112,6 +147,9 @@ impl WindowImpl {
             surface: None,
             callback: Box::new(callback),
             last_frame: vec![0u32; (self.width * self.height) as usize],
+            latest_frame: self.latest_frame,
+            paint_event_pending: self.paint_event_pending,
+            redraw_event_pending: self.redraw_event_pending,
         };
 
         Ok(self.event_loop.run_app(&mut handler)?)
@@ -277,6 +315,9 @@ where
     context: Option<Context<Arc<WinitWindow>>>,
     surface: Option<Surface<Arc<WinitWindow>, Arc<WinitWindow>>>,
     callback: Box<C>,
+    latest_frame: Arc<Mutex<Option<Vec<u32>>>>,
+    paint_event_pending: Arc<AtomicBool>,
+    redraw_event_pending: Arc<AtomicBool>,
 }
 
 impl<C> ApplicationHandlerImpl<C>
@@ -377,7 +418,8 @@ where
     C: FnMut(WindowCallbackEvent) -> wie_util::Result<()> + 'static,
 {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
-        self.callback(WindowCallbackEvent::Update, event_loop)
+        self.callback(WindowCallbackEvent::Update, event_loop);
+        event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(4)));
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -398,11 +440,16 @@ where
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowInternalEvent) {
         match event {
             WindowInternalEvent::RequestRedraw => {
+                self.redraw_event_pending.store(false, Ordering::Release);
                 self.window.as_ref().unwrap().request_redraw();
             }
-            WindowInternalEvent::Paint(data) => {
-                self.last_frame = data;
-                self.paint_last_frame();
+            WindowInternalEvent::Paint => {
+                self.paint_event_pending.store(false, Ordering::Release);
+                let latest_frame = self.latest_frame.lock().unwrap().take();
+                if let Some(data) = latest_frame {
+                    self.last_frame = data;
+                    self.paint_last_frame();
+                }
             }
             WindowInternalEvent::Quit => {
                 event_loop.exit();

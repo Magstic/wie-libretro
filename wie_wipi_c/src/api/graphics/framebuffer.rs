@@ -1,7 +1,7 @@
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec};
 use core::ops::{Deref, DerefMut};
 
-use bytemuck::pod_collect_to_vec;
+use bytemuck::{Zeroable, cast_slice_mut};
 
 use wipi_types::wipic::{WIPICFramebuffer, WIPICIndirectPtr, WIPICWord};
 
@@ -51,46 +51,28 @@ impl FrameBuffer {
         }))
     }
 
-    pub fn data(&self, context: &dyn WIPICContext) -> Result<Vec<u8>> {
-        let size = self.0.width * self.0.height * self.0.bpp / 8;
-        let mut buf = vec![0; size as _];
-        context.read_bytes(context.data_ptr(self.0.buf)?, &mut buf)?;
+    fn image_buffer<T>(&self, context: &dyn WIPICContext) -> Result<VecImageBuffer<T>>
+    where
+        T: PixelType + 'static,
+    {
+        let mut pixels = vec![T::DataType::zeroed(); (self.0.width * self.0.height) as usize];
+        context.read_bytes(context.data_ptr(self.0.buf)?, cast_slice_mut(&mut pixels))?;
 
-        Ok(buf)
+        Ok(VecImageBuffer::from_raw(self.0.width, self.0.height, pixels))
     }
 
     pub fn image(&self, context: &mut dyn WIPICContext) -> Result<Box<dyn Image>> {
-        let data = self.data(context)?;
-
         Ok(match self.0.bpp {
-            16 => Box::new(VecImageBuffer::<Rgb565Pixel>::from_raw(
-                self.0.width as _,
-                self.0.height as _,
-                pod_collect_to_vec(&data),
-            )),
-            32 => Box::new(VecImageBuffer::<ArgbPixel>::from_raw(
-                self.0.width as _,
-                self.0.height as _,
-                pod_collect_to_vec(&data),
-            )),
+            16 => Box::new(self.image_buffer::<Rgb565Pixel>(context)?),
+            32 => Box::new(self.image_buffer::<ArgbPixel>(context)?),
             _ => unimplemented!("Unsupported pixel format: {}", self.0.bpp),
         })
     }
 
     pub fn canvas<'a>(&'a self, context: &'a mut dyn WIPICContext) -> Result<FramebufferCanvas<'a>> {
-        let data = self.data(context)?;
-
         let canvas: Box<dyn Canvas> = match self.0.bpp {
-            16 => Box::new(ImageBufferCanvas::new(VecImageBuffer::<Rgb565Pixel>::from_raw(
-                self.0.width as _,
-                self.0.height as _,
-                pod_collect_to_vec(&data),
-            ))),
-            32 => Box::new(ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::from_raw(
-                self.0.width as _,
-                self.0.height as _,
-                pod_collect_to_vec(&data),
-            ))),
+            16 => Box::new(ImageBufferCanvas::new(self.image_buffer::<Rgb565Pixel>(context)?)),
+            32 => Box::new(ImageBufferCanvas::new(self.image_buffer::<ArgbPixel>(context)?)),
             _ => unimplemented!("Unsupported pixel format: {}", self.0.bpp),
         };
 

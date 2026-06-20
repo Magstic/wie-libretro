@@ -65,6 +65,11 @@ enum KindTag {
     Strlen,
     InlineCopy,
     RegInlineCopy,
+    RegInlineFill16,
+    RegInlineFill16Regs,
+    RegInlineBlend16Quarter,
+    RegInlineBlend16Half,
+    RegInlineBlend16Mixed,
 }
 
 impl RawEntry {
@@ -233,6 +238,13 @@ fn pc_kind(raw: &RawHook, entry_name: &str) -> HookKind {
                 .unwrap_or_else(|| panic!("entry {entry_name}: inline_copy requires spill_back")),
         }),
         KindTag::RegInlineCopy => panic!("entry {entry_name}: reg_inline_copy must be pattern-based, not pc-based"),
+        KindTag::RegInlineFill16 => panic!("entry {entry_name}: reg_inline_fill16 must be pattern-based, not pc-based"),
+        KindTag::RegInlineFill16Regs => panic!("entry {entry_name}: reg_inline_fill16_regs must be pattern-based, not pc-based"),
+        KindTag::RegInlineBlend16Quarter => {
+            panic!("entry {entry_name}: reg_inline_blend16_quarter must be pattern-based, not pc-based")
+        }
+        KindTag::RegInlineBlend16Half => panic!("entry {entry_name}: reg_inline_blend16_half must be pattern-based, not pc-based"),
+        KindTag::RegInlineBlend16Mixed => panic!("entry {entry_name}: reg_inline_blend16_mixed must be pattern-based, not pc-based"),
     }
 }
 
@@ -260,6 +272,11 @@ fn pattern_template(raw: &RawHook, tokens: &[PatternToken], entry_name: &str) ->
                     .unwrap_or_else(|| panic!("entry {entry_name}: reg_inline_copy requires count_offset")),
             }
         }
+        KindTag::RegInlineFill16 => PatternHookKind::RegInlineFill16,
+        KindTag::RegInlineFill16Regs => PatternHookKind::RegInlineFill16Regs,
+        KindTag::RegInlineBlend16Quarter => PatternHookKind::RegInlineBlend16Quarter,
+        KindTag::RegInlineBlend16Half => PatternHookKind::RegInlineBlend16Half,
+        KindTag::RegInlineBlend16Mixed => PatternHookKind::RegInlineBlend16Mixed,
         KindTag::InlineCopy => {
             let exit_cap = tokens.iter().any(|t| matches!(t, PatternToken::Capture(CaptureName::ExitB)));
             if !exit_cap && raw.exit_pc.is_none() {

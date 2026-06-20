@@ -22,7 +22,7 @@ pub enum TextAlignment {
     Right,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
     pub a: u8,
     pub r: u8,
@@ -35,8 +35,19 @@ pub trait Image: Send {
     fn height(&self) -> u32;
     fn bytes_per_pixel(&self) -> u32;
     fn get_pixel(&self, x: i32, y: i32) -> Color;
+    fn get_pixels(&self, x: i32, y: i32, colors: &mut [Color]) {
+        for (offset, color) in colors.iter_mut().enumerate() {
+            *color = self.get_pixel(x + offset as i32, y);
+        }
+    }
     fn raw(&self) -> Cow<'_, [u8]>;
     fn colors(&self) -> Vec<Color>;
+    fn argb8888(&self) -> Vec<u32> {
+        self.colors()
+            .into_iter()
+            .map(|color| ((color.a as u32) << 24) | ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
+            .collect()
+    }
 }
 
 pub trait ImageBuffer: Send {
@@ -222,12 +233,29 @@ where
         T::to_color(raw)
     }
 
+    fn get_pixels(&self, x: i32, y: i32, colors: &mut [Color]) {
+        let offset = y as usize * self.width as usize + x as usize;
+        for (raw, color) in self.data[offset..offset + colors.len()].iter().zip(colors) {
+            *color = T::to_color(*raw);
+        }
+    }
+
     fn raw(&self) -> Cow<'_, [u8]> {
         cast_slice(&self.data).into()
     }
 
     fn colors(&self) -> Vec<Color> {
         self.data.iter().map(|&x| T::to_color(x)).collect()
+    }
+
+    fn argb8888(&self) -> Vec<u32> {
+        self.data
+            .iter()
+            .map(|&raw| {
+                let color = T::to_color(raw);
+                ((color.a as u32) << 24) | ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
+            })
+            .collect()
     }
 }
 
@@ -246,17 +274,30 @@ where
     }
 
     fn put_pixels(&mut self, x: i32, y: i32, width: u32, colors: &[Color]) {
-        for (i, color) in colors.iter().enumerate() {
-            let x = x + (i as i32 % (width as i32));
-            let y = y + (i as i32 / (width as i32));
+        if width == 0 {
+            return;
+        }
 
-            if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+        for (row, colors) in colors.chunks(width as usize).enumerate() {
+            let destination_y = y as i64 + row as i64;
+            if destination_y < 0 || destination_y >= self.height as i64 {
                 continue;
             }
 
-            let raw = T::from_color(*color);
+            let source_start = (-(x as i64)).max(0) as usize;
+            let source_end = colors.len().min((self.width as i64 - x as i64).max(0) as usize);
+            if source_start >= source_end {
+                continue;
+            }
 
-            self.data[((y as u32) * self.width + (x as u32)) as usize] = raw;
+            let destination_x = x as i64 + source_start as i64;
+            let destination_start = destination_y as usize * self.width as usize + destination_x as usize;
+            for (destination, color) in self.data[destination_start..destination_start + source_end - source_start]
+                .iter_mut()
+                .zip(&colors[source_start..source_end])
+            {
+                *destination = T::from_color(*color);
+            }
         }
     }
 }
@@ -284,17 +325,26 @@ where
         if x < 0 || y < 0 || (x as u32) >= self.image_buffer.width() || (y as u32) >= self.image_buffer.height() {
             return;
         }
+        if color.a == 0 {
+            return;
+        }
+        if color.a == 0xff {
+            self.image_buffer.put_pixel(x, y, color);
+            return;
+        }
+
         let bg = self.image_buffer.get_pixel(x, y);
-        let factor = color.a as f32 / 255.0;
+        let alpha = color.a as u32;
+        let inverse_alpha = 255 - alpha;
 
         let computed_color = Color {
             a: 0xff,
-            r: (color.r as f32 * factor + bg.r as f32 * (1.0 - factor)) as u8,
-            g: (color.g as f32 * factor + bg.g as f32 * (1.0 - factor)) as u8,
-            b: (color.b as f32 * factor + bg.b as f32 * (1.0 - factor)) as u8,
+            r: ((color.r as u32 * alpha + bg.r as u32 * inverse_alpha) / 255) as u8,
+            g: ((color.g as u32 * alpha + bg.g as u32 * inverse_alpha) / 255) as u8,
+            b: ((color.b as u32 * alpha + bg.b as u32 * inverse_alpha) / 255) as u8,
         };
 
-        self.put_pixel(x, y, computed_color);
+        self.image_buffer.put_pixel(x, y, computed_color);
     }
 }
 
@@ -308,20 +358,36 @@ where
     }
 
     fn draw(&mut self, dx: i32, dy: i32, w: u32, h: u32, src: &dyn Image, sx: i32, sy: i32, clip: Clip) {
-        for y in 0..(h as i32) {
-            for x in 0..(w as i32) {
-                if sx + x < 0 || sy + y < 0 || sx + x >= src.width() as i32 || sy + y >= src.height() as i32 {
-                    continue;
-                }
-                if dx + x < 0 || dy + y < 0 || dx + x >= self.image_buffer.width() as i32 || dy + y >= self.image_buffer.height() as i32 {
-                    continue;
-                }
-                if dx + x < clip.x || dx + x >= clip.x + (clip.width as i32) || dy + y < clip.y || dy + y >= clip.y + (clip.height as i32) {
-                    continue;
-                }
+        let clip_right = clip.x as i64 + clip.width as i64;
+        let clip_bottom = clip.y as i64 + clip.height as i64;
+        let x_start = 0i64.max(-(sx as i64)).max(-(dx as i64)).max(clip.x as i64 - dx as i64);
+        let y_start = 0i64.max(-(sy as i64)).max(-(dy as i64)).max(clip.y as i64 - dy as i64);
+        let x_end = (w as i64)
+            .min(src.width() as i64 - sx as i64)
+            .min(self.image_buffer.width() as i64 - dx as i64)
+            .min(clip_right - dx as i64);
+        let y_end = (h as i64)
+            .min(src.height() as i64 - sy as i64)
+            .min(self.image_buffer.height() as i64 - dy as i64)
+            .min(clip_bottom - dy as i64);
+        if x_start >= x_end || y_start >= y_end {
+            return;
+        }
 
-                // TODO blend multiple pixels at once for performance
-                self.blend_pixel(dx + x, dy + y, src.get_pixel(sx + x, sy + y));
+        let row_width = (x_end - x_start) as usize;
+        let mut source_row = vec![Color { a: 0, r: 0, g: 0, b: 0 }; row_width];
+        for row in y_start..y_end {
+            let source_y = sy + row as i32;
+            let destination_y = dy + row as i32;
+            let destination_x = dx + x_start as i32;
+            src.get_pixels(sx + x_start as i32, source_y, &mut source_row);
+
+            if source_row.iter().all(|color| color.a == 0xff) {
+                self.image_buffer.put_pixels(destination_x, destination_y, row_width as u32, &source_row);
+            } else {
+                for (column, color) in source_row.iter().enumerate() {
+                    self.blend_pixel(destination_x + column as i32, destination_y, *color);
+                }
             }
         }
     }
@@ -342,8 +408,11 @@ where
         let mut x = x1;
         let mut y = y1;
 
-        while x != x2 || y != y2 {
+        loop {
             self.blend_pixel(x as _, y as _, color);
+            if x == x2 && y == y2 {
+                break;
+            }
 
             let e2 = 2 * err;
             if e2 > -dy {
@@ -398,40 +467,19 @@ where
     }
 
     fn draw_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Color, clip: Clip) {
-        // TODO use put_pixels
-        for x in x..x + (w as i32) {
-            if x < 0 || x >= self.image_buffer.width() as i32 {
-                continue;
-            }
-            if x < clip.x || x >= clip.x + clip.width as i32 {
-                continue;
-            }
-            if y < 0 || y >= self.image_buffer.height() as i32 {
-                continue;
-            }
-            if y < clip.y || y >= clip.y + clip.height as i32 {
-                continue;
-            }
-
-            self.put_pixel(x, y, color);
-            self.put_pixel(x, y + (h as i32) - 1, color);
+        if w == 0 || h == 0 {
+            return;
         }
-        for y in y..y + (h as i32) {
-            if x < 0 || x >= self.image_buffer.width() as i32 {
-                continue;
-            }
-            if x < clip.x || x >= clip.x + clip.width as i32 {
-                continue;
-            }
-            if y < 0 || y >= self.image_buffer.height() as i32 {
-                continue;
-            }
-            if y < clip.y || y >= clip.y + clip.height as i32 {
-                continue;
-            }
 
-            self.put_pixel(x, y, color);
-            self.put_pixel(x + (w as i32) - 1, y, color);
+        self.fill_rect(x, y, w, 1, color, clip);
+        if h > 1 {
+            self.fill_rect(x, y.saturating_add_unsigned(h - 1), w, 1, color, clip);
+        }
+        if h > 2 {
+            self.fill_rect(x, y.saturating_add(1), 1, h - 2, color, clip);
+            if w > 1 {
+                self.fill_rect(x.saturating_add_unsigned(w - 1), y.saturating_add(1), 1, h - 2, color, clip);
+            }
         }
     }
 
@@ -446,17 +494,21 @@ where
     }
 
     fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Color, clip: Clip) {
-        // TODO use put_pixels
-        for y in y..y + (h as i32) {
-            for x in x..x + (w as i32) {
-                if x >= self.image_buffer.width() as i32 || y >= self.image_buffer.height() as i32 {
-                    continue;
-                }
-                if x < clip.x || x >= clip.x + clip.width as i32 || y < clip.y || y >= clip.y + clip.height as i32 {
-                    continue;
-                }
-                self.put_pixel(x, y, color);
-            }
+        let x_start = (x as i64).max(0).max(clip.x as i64);
+        let y_start = (y as i64).max(0).max(clip.y as i64);
+        let x_end = (x as i64 + w as i64)
+            .min(self.image_buffer.width() as i64)
+            .min(clip.x as i64 + clip.width as i64);
+        let y_end = (y as i64 + h as i64)
+            .min(self.image_buffer.height() as i64)
+            .min(clip.y as i64 + clip.height as i64);
+        if x_start >= x_end || y_start >= y_end {
+            return;
+        }
+
+        let row = vec![color; (x_end - x_start) as usize];
+        for y in y_start..y_end {
+            self.image_buffer.put_pixels(x_start as i32, y as i32, row.len() as u32, &row);
         }
     }
 
@@ -475,6 +527,7 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Clip {
     pub x: i32,
     pub y: i32,
@@ -484,16 +537,16 @@ pub struct Clip {
 
 impl Clip {
     pub fn intersect(&self, other: &Clip) -> Clip {
-        let x = self.x.max(other.x);
-        let y = self.y.max(other.y);
-        let width = (self.x + (self.width as i32)).min(other.x + (other.width as i32)) - x;
-        let height = (self.y + (self.height as i32)).min(other.y + (other.height as i32)) - y;
+        let x = self.x.max(other.x) as i64;
+        let y = self.y.max(other.y) as i64;
+        let right = (self.x as i64 + self.width as i64).min(other.x as i64 + other.width as i64);
+        let bottom = (self.y as i64 + self.height as i64).min(other.y as i64 + other.height as i64);
 
         Clip {
-            x,
-            y,
-            width: width as _,
-            height: height as _,
+            x: x as i32,
+            y: y as i32,
+            width: (right - x).max(0) as u32,
+            height: (bottom - y).max(0) as u32,
         }
     }
 }
@@ -531,6 +584,8 @@ pub fn string_width(string: &str, pt_size: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use wie_util::Result;
 
     use crate::canvas::{Clip, Image, ImageBufferCanvas};
@@ -562,5 +617,78 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn draw_clips_and_blends_without_touching_uncovered_pixels() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::from_raw(3, 1, vec![0xff0000ff; 3]));
+        let source = VecImageBuffer::<ArgbPixel>::from_raw(3, 1, vec![0x00ff0000, 0x80ff0000, 0xffff0000]);
+
+        canvas.draw(
+            0,
+            0,
+            3,
+            1,
+            &source,
+            0,
+            0,
+            Clip {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 1,
+            },
+        );
+
+        assert_eq!(
+            canvas.image().colors(),
+            vec![
+                Color {
+                    a: 0xff,
+                    r: 0,
+                    g: 0,
+                    b: 0xff
+                },
+                Color {
+                    a: 0xff,
+                    r: 128,
+                    g: 0,
+                    b: 127
+                },
+                Color {
+                    a: 0xff,
+                    r: 0xff,
+                    g: 0,
+                    b: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clip_intersection_is_empty_when_rectangles_do_not_overlap() {
+        let result = Clip {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }
+        .intersect(&Clip {
+            x: 20,
+            y: 20,
+            width: 5,
+            height: 5,
+        });
+
+        assert_eq!(result.width, 0);
+        assert_eq!(result.height, 0);
+    }
+
+    #[test]
+    fn draw_line_includes_both_endpoints() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(3, 1));
+        canvas.draw_line(0, 0, 2, 0, Color { a: 0xff, r: 1, g: 2, b: 3 });
+
+        assert_eq!(canvas.image().colors(), vec![Color { a: 0xff, r: 1, g: 2, b: 3 }; 3]);
     }
 }

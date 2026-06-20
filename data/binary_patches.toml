@@ -14,7 +14,7 @@
 # never both. Pattern tokens are whitespace-separated and each token is one of:
 #   - `??`        — any byte (unnamed wildcard)
 #   - `xx`        — literal hex byte
-#   - `{dst}`     — 1 byte, Thumb1 `SUBS Rn, #imm8` imm8 → `-(b as i8) as i32`
+#   - `{dst}`     — 1 byte, Thumb1 `SUBS Rn, #imm8` imm8 → `-(b as i32)`
 #   - `{src}`     — same, src offset
 #   - `{len}`     — same, len offset (omit capture + provide `len_offset` to pin)
 #   - `{exit_b}`  — TWO consecutive tokens, encoding a Thumb `B imm11` instruction
@@ -51,7 +51,7 @@
 # generic (hash-less) entries warn and continue.
 
 [[entry]]
-name = "Generic compiler library / inline copy patterns"
+name = "Generic compiler loops and library patterns"
 
 # Per-frame byte-by-byte memcpy with `src/dst/count` in registers.
 # Loop:
@@ -66,6 +66,37 @@ name = "Generic compiler library / inline copy patterns"
 kind = "reg_inline_copy"
 pattern = "0b00sss011 78 0b00ddd011 70 0b00ccc011 1c 01 0b00110sss 01 0b00110ddd 01 0b00111ccc 00 2b f7 dc"
 count_offset = 1
+
+# Thumb RGB565 row fill emitted by the compiler used for LGT Clets:
+#   MOV R5, IP; STRH R5, [R1]; ADDS R3, #1; ADDS R1, #2
+#   LDR R5, [SP]; CMP R3, R5; BLT loop
+# R3 is the current pixel index and [SP] is the row width. Replacing this
+# inner loop keeps the outer rectangle loop and all clipping/address logic in
+# guest code while performing the contiguous 16-bit fill in one host call.
+[[entry.hook]]
+kind = "reg_inline_fill16"
+pattern = "65 46 0d 80 01 33 02 31 00 9d ab 42 f8 db"
+
+# Same operation with all loop state in low registers:
+# destination=R3, color=R5, current=R2, width=R4.
+[[entry.hook]]
+kind = "reg_inline_fill16_regs"
+pattern = "1d 80 01 32 02 33 a2 42 fa db"
+
+# RGB565 blend modes emitted next to the fill loops above. The exact patterns
+# include their stack offsets and registers, so a match fully identifies the
+# formula used by each host fast path.
+[[entry.hook]]
+kind = "reg_inline_blend16_quarter"
+pattern = "13 88 04 9d 33 40 9b 08 eb 18 06 9d eb 18 13 80 01 31 02 32 01 9b 99 42 f2 db"
+
+[[entry.hook]]
+kind = "reg_inline_blend16_half"
+pattern = "13 88 08 9d 33 40 5b 08 eb 18 13 80 01 31 02 32 01 9b 99 42 f4 db"
+
+[[entry.hook]]
+kind = "reg_inline_blend16_mixed"
+pattern = "0a 88 05 9b 13 40 9b 08 00 93 03 9b 1a 40 00 9b 52 08 9a 18 07 9b 9a 18 00 92 6a 46 12 88 01 34 0a 80 02 31 b4 42 eb db"
 
 # Thumb -O0 byte copy: `*dst++ = *src++` with `dst`/`src`/`len` all on the
 # stack. Src is reached via single-instruction `SUBS R4, R7, #4` (`3c 1f`),
