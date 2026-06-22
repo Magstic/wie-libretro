@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use wie_backend::{RecordId, System};
+use wie_backend::RecordId;
 
 pub struct LibretroDatabaseRepository {
     base_path: PathBuf,
@@ -38,16 +38,16 @@ impl LibretroDatabaseRepository {
 
 #[async_trait::async_trait]
 impl wie_backend::DatabaseRepository for LibretroDatabaseRepository {
-    async fn open(&self, _system: &System, name: &str, app_id: &str) -> Box<dyn wie_backend::Database> {
+    async fn open(&self, name: &str, app_id: &str) -> Box<dyn wie_backend::Database> {
         let path = self.path_for_database(name, app_id);
         Box::new(LibretroDatabase::new(path))
     }
 
-    async fn exists(&self, _system: &System, name: &str, app_id: &str) -> bool {
+    async fn exists(&self, name: &str, app_id: &str) -> bool {
         self.path_for_database(name, app_id).is_dir()
     }
 
-    async fn delete(&self, _system: &System, name: &str, app_id: &str) -> bool {
+    async fn delete(&self, name: &str, app_id: &str) -> bool {
         let path = self.path_for_database(name, app_id);
         match fs::remove_dir_all(path) {
             Ok(()) => true,
