@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+hooks = ["wie_core_arm/hooks"]
+
 [dependencies]
 async-recursion = { workspace = true }
 async-trait = { workspace = true }

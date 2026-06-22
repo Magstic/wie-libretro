@@ -148,6 +148,12 @@ impl Emulator for J2MEEmulator {
     }
 }
 
+impl Drop for J2MEEmulator {
+    fn drop(&mut self) {
+        self.system.shutdown();
+    }
+}
+
 struct J2MEDescriptor {
     name: String,
     main_class_name: String,

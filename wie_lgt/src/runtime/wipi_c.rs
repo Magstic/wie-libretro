@@ -5,7 +5,7 @@ mod context;
 use jvm::{Jvm, Result as JvmResult, runtime::JavaLangString};
 use jvm_rust::ClassDefinitionImpl;
 use wipi_types::lgt::CletFunctions;
-use wipi_types::wipic::WIPICIndirectPtr;
+use wipi_types::wipic::{WIPICIndirectPtr, WIPICWord};
 
 use wie_backend::System;
 use wie_core_arm::{ArmCore, EmulatedFunction, EmulatedFunctionParam, ResultWriter, SvcId};
@@ -87,8 +87,8 @@ async fn handle_wipic_svc(core: &mut ArmCore, (system, jvm): &mut (System, Jvm),
         WIPICSvcId::DrawImage => graphics::draw_image.into_body(),
         WIPICSvcId::CopyArea => graphics::copy_area.into_body(),
         WIPICSvcId::DrawString => graphics::draw_string.into_body(),
-        WIPICSvcId::GetRgbPixels => graphics::get_rgb_pixels.into_body(),
-        WIPICSvcId::SetRgbPixels => graphics::set_rgb_pixels.into_body(),
+        WIPICSvcId::GetRgbPixels => get_rgb_pixels.into_body(),
+        WIPICSvcId::SetRgbPixels => set_rgb_pixels.into_body(),
         WIPICSvcId::FlushLcd => graphics::flush_lcd.into_body(),
         WIPICSvcId::GetPixelFromRgb => graphics::get_pixel_from_rgb.into_body(),
         WIPICSvcId::GetRgbFromPixel => graphics::get_rgb_from_pixel.into_body(),
@@ -154,6 +154,46 @@ async fn handle_wipic_svc(core: &mut ArmCore, (system, jvm): &mut (System, Jvm),
     )
     .await?
     .write(core, lr)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_rgb_pixels(
+    context: &mut dyn WIPICContext,
+    src: WIPICIndirectPtr,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    pd: WIPICWord,
+    ipl: i32,
+) -> Result<()> {
+    // LGT passes scan lengths in 32-bit pixels; the shared helper keeps its byte-stride ABI for KTF compatibility.
+    let Some(byte_stride) = ipl.checked_mul(4) else {
+        tracing::warn!("LGT MC_grpGetRGBPixels: row stride overflow (ipl={ipl})");
+        return Ok(());
+    };
+
+    graphics::get_rgb_pixels(context, src, x, y, w, h, pd, byte_stride).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_rgb_pixels(
+    context: &mut dyn WIPICContext,
+    dst: WIPICIndirectPtr,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    psrc: WIPICWord,
+    ibpl: i32,
+    pgc: WIPICWord,
+) -> Result<()> {
+    let Some(byte_stride) = ibpl.checked_mul(4) else {
+        tracing::warn!("LGT MC_grpSetRGBPixels: row stride overflow (ibpl={ibpl})");
+        return Ok(());
+    };
+
+    graphics::set_rgb_pixels(context, dst, x, y, w, h, psrc, byte_stride, pgc).await
 }
 
 #[async_trait::async_trait]

@@ -60,6 +60,11 @@ impl System {
         self.executor.tick(move || platform.now())
     }
 
+    pub fn shutdown(&self) {
+        self.audio.write().shutdown();
+        self.executor.clear();
+    }
+
     pub fn spawn<C>(&self, callable: C)
     where
         C: AsyncCallable<Result<()>> + 'static + Send,

@@ -2,6 +2,7 @@
 extern crate alloc;
 
 mod allocator;
+#[cfg(feature = "hooks")]
 mod binary_patches;
 mod context;
 mod core;
@@ -18,7 +19,14 @@ pub type ThreadId = usize;
 
 pub use self::{
     allocator::Allocator,
-    binary_patches::install_binary_patches,
     core::{ArmCore, RUN_FUNCTION_LR, RunFunctionResult},
     function::{EmulatedFunction, EmulatedFunctionParam, RegisteredFunction, RegisteredFunctionHolder, ResultWriter, SvcId},
 };
+
+#[cfg(feature = "hooks")]
+pub use self::binary_patches::install_binary_patches;
+
+#[cfg(not(feature = "hooks"))]
+pub fn install_binary_patches(_core: &mut ArmCore, _data: &[u8], _scan_ranges: &[(u32, u32)]) -> wie_util::Result<usize> {
+    Ok(0)
+}

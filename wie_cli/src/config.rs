@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::Path,
-};
+use std::{collections::HashMap, fs, path::Path};
 
 use gilrs::Button;
 use winit::keyboard::KeyCode as WinitKeyCode;
@@ -186,79 +182,18 @@ impl Config {
             }
         }
 
-        let mut missing_sections = Vec::new();
-        let mut missing_keyboard = Vec::new();
-        let mut missing_gamepad = Vec::new();
-
         for (source, target) in DEFAULT_KEYBOARD_MAP {
-            if keyboard.contains_key(source) {
-                continue;
-            }
-
-            keyboard.insert(*source, *target);
-            missing_keyboard.push(format!("{} = {}", format_winit_key_code(*source), format_backend_key_code(*target)));
+            keyboard.entry(*source).or_insert(*target);
         }
 
         for (source, target) in DEFAULT_GAMEPAD_BUTTON_MAP {
             let source = GamepadInput::Button(*source);
-            if gamepad.contains_key(&source) {
-                continue;
-            }
-
-            gamepad.insert(source, *target);
-            missing_gamepad.push(format!("{} = {}", format_gamepad_input(source), format_backend_key_code(*target)));
+            gamepad.entry(source).or_insert(*target);
         }
 
         for (source, target) in DEFAULT_GAMEPAD_AXIS_MAP {
             let source = GamepadInput::Axis(*source);
-            if gamepad.contains_key(&source) {
-                continue;
-            }
-
-            gamepad.insert(source, *target);
-            missing_gamepad.push(format!("{} = {}", format_gamepad_input(source), format_backend_key_code(*target)));
-        }
-
-        if !missing_keyboard.is_empty() {
-            let mut block = String::from("[keyboard]\n");
-            for line in missing_keyboard {
-                block.push_str(&line);
-                block.push('\n');
-            }
-            missing_sections.push(block);
-        }
-
-        if !missing_gamepad.is_empty() {
-            let mut block = String::from("[gamepad]\n");
-            for line in missing_gamepad {
-                block.push_str(&line);
-                block.push('\n');
-            }
-            missing_sections.push(block);
-        }
-
-        let header = config_header();
-        let mut updated_content = content.clone();
-        let mut needs_rewrite = false;
-
-        if !missing_sections.is_empty() {
-            if !updated_content.ends_with('\n') {
-                updated_content.push('\n');
-            }
-            for section in missing_sections {
-                updated_content.push('\n');
-                updated_content.push_str(&section);
-            }
-            needs_rewrite = true;
-        }
-
-        if !updated_content.starts_with(&header) {
-            updated_content = format!("{header}{updated_content}");
-            needs_rewrite = true;
-        }
-
-        if needs_rewrite {
-            fs::write(path, updated_content)?;
+            gamepad.entry(source).or_insert(*target);
         }
 
         Ok(Self { keyboard, gamepad })
@@ -285,7 +220,7 @@ impl Config {
     }
 
     fn to_cfg_string(&self) -> String {
-        let mut output = String::from(config_header());
+        let mut output = config_header();
         output.push_str("[keyboard]\n");
         for (source, target) in DEFAULT_KEYBOARD_MAP {
             output.push_str(&format!("{} = {}\n", format_winit_key_code(*source), format_backend_key_code(*target)));
@@ -480,7 +415,7 @@ fn config_header() -> String {
     let mut output = String::from("# Available mobile key names:\n");
     output.push_str("# ");
     output.push_str(&AVAILABLE_PHONE_KEY_NAMES.join(" "));
-    output.push_str("\n");
+    output.push('\n');
     output.push_str("# Keyboard values use Winit physical key names.\n");
     output.push_str("# Gamepad values use GilRs button names plus axis directions.\n");
     output.push_str(

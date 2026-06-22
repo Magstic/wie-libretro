@@ -1,0 +1,10 @@
+display_name = "Mobile - Korea (Wie-Libretro)"
+authors = "Developers: dlunch | Core Port: Magstic"
+supported_extensions = "zip"
+corename = "Wie-Libretro"
+categories = "Emulator"
+license = "MIT"
+permissions = ""
+display_version = "0.0.1"
+firmware_count = 0
+notes = "WIPI/SKVM/J2ME Libretro Core"

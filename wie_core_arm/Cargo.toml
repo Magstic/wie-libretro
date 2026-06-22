@@ -4,13 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+hooks = ["dep:md5", "dep:serde", "dep:toml"]
+
 [dependencies]
 async-trait = { workspace = true }
 bytemuck = { workspace = true }
-md5 = { workspace = true }
-serde = { version = "^1", default-features = false, features = ["derive", "alloc"] }
+md5 = { workspace = true, optional = true }
+serde = { version = "^1", default-features = false, features = ["derive", "alloc"], optional = true }
 spin = { workspace = true }
-toml = { version = "^1", default-features = false, features = ["parse", "serde"] }
+toml = { version = "^1", default-features = false, features = ["parse", "serde"], optional = true }
 tracing = { workspace = true }
 
 arm32_cpu = { git = "https://github.com/dlunch/arm32_cpu.git" }

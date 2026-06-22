@@ -23,7 +23,9 @@ pub enum SmafEvent {
 }
 
 pub fn parse_smaf(raw: &[u8]) -> Vec<(usize, SmafEvent)> {
-    let smaf = Smaf::parse(raw).unwrap();
+    let Ok(smaf) = Smaf::parse(raw) else {
+        return Vec::new();
+    };
 
     let mut result = Vec::new();
     let mut handy_channel_offset = 0;
@@ -273,7 +275,14 @@ fn parse_sequence_events(
                     } else {
                         let midi_channel = tone_map.real_channel(channel);
                         let value = tone_map.effective_volume(channel);
-                        result.push((time, SmafEvent::MidiControlChange { channel: midi_channel, control: 7, value }));
+                        result.push((
+                            time,
+                            SmafEvent::MidiControlChange {
+                                channel: midi_channel,
+                                control: 7,
+                                value,
+                            },
+                        ));
                     }
                 } else {
                     let channel = tone_map.real_channel(channel);
@@ -1010,15 +1019,30 @@ mod tests {
         assert!(setup
             .iter()
             .any(|(_, event)| matches!(event, SmafEvent::MidiProgramChange { channel: 15, program: 99 })));
-        assert!(setup
-            .iter()
-            .any(|(_, event)| matches!(event, SmafEvent::MidiControlChange { channel: 0, control: 91, value: 92 })));
-        assert!(setup
-            .iter()
-            .any(|(_, event)| matches!(event, SmafEvent::MidiControlChange { channel: 15, control: 7, value: 56 })));
-        assert!(setup
-            .iter()
-            .any(|(_, event)| matches!(event, SmafEvent::MidiControlChange { channel: 15, control: 72, value: 22 })));
+        assert!(setup.iter().any(|(_, event)| matches!(
+            event,
+            SmafEvent::MidiControlChange {
+                channel: 0,
+                control: 91,
+                value: 92
+            }
+        )));
+        assert!(setup.iter().any(|(_, event)| matches!(
+            event,
+            SmafEvent::MidiControlChange {
+                channel: 15,
+                control: 7,
+                value: 56
+            }
+        )));
+        assert!(setup.iter().any(|(_, event)| matches!(
+            event,
+            SmafEvent::MidiControlChange {
+                channel: 15,
+                control: 72,
+                value: 22
+            }
+        )));
 
         let notes = tone_map.emit_atmosphere_notes(100, 200, 7, 84, 64);
         assert!(notes
@@ -1190,9 +1214,14 @@ mod tests {
         ];
 
         let (events, _) = parse_sequence_events(&sequence, 1, 1, 0, true, &[], &mut tone_map);
-        assert!(events
-            .iter()
-            .any(|(_, event)| matches!(event, SmafEvent::MidiControlChange { channel: 0, control: 7, value: 72 })));
+        assert!(events.iter().any(|(_, event)| matches!(
+            event,
+            SmafEvent::MidiControlChange {
+                channel: 0,
+                control: 7,
+                value: 72
+            }
+        )));
         assert!(!events
             .iter()
             .any(|(_, event)| matches!(event, SmafEvent::MidiControlChange { channel: 0, control: 11, .. })));

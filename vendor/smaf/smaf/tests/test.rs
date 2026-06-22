@@ -150,8 +150,7 @@ fn test_pcm_long_expression_consumes_value_byte() -> anyhow::Result<()> {
 
 #[test]
 fn test_mobile_variable_number_uses_seven_payload_bits() -> anyhow::Result<()> {
-    let (_, events) = SequenceData::parse_mobile(&[0xc0, 0x00, 0x80, 0x3c, 0x01, 0x00, 0xff, 0x2f, 0x00])
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (_, events) = SequenceData::parse_mobile(&[0xc0, 0x00, 0x80, 0x3c, 0x01, 0x00, 0xff, 0x2f, 0x00]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     assert_eq!(events[0].duration, 8192);
     assert!(matches!(
@@ -168,8 +167,7 @@ fn test_mobile_variable_number_uses_seven_payload_bits() -> anyhow::Result<()> {
 
 #[test]
 fn test_handy_variable_number_matches_smaf2midi_converter() -> anyhow::Result<()> {
-    let (_, events) = SequenceData::parse_handy(&[0xc0, 0x00, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00])
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (_, events) = SequenceData::parse_handy(&[0xc0, 0x00, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     assert_eq!(events[0].duration, 8320);
 
@@ -178,24 +176,16 @@ fn test_handy_variable_number_matches_smaf2midi_converter() -> anyhow::Result<()
 
 #[test]
 fn test_handy_short_pitch_bend_matches_smaf2midi_converter() -> anyhow::Result<()> {
-    let (_, events) = SequenceData::parse_handy(&[0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00])
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (_, events) = SequenceData::parse_handy(&[0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    assert!(matches!(
-        events[0].event,
-        ScoreTrackSequenceEvent::PitchBend {
-            channel: 0,
-            value: 1024
-        }
-    ));
+    assert!(matches!(events[0].event, ScoreTrackSequenceEvent::PitchBend { channel: 0, value: 1024 }));
 
     Ok(())
 }
 
 #[test]
 fn test_handy_note_keeps_raw_pitch_for_player_mapping() -> anyhow::Result<()> {
-    let (_, events) = SequenceData::parse_handy(&[0x00, 0x29, 0x01, 0x00, 0x00, 0x00, 0x00])
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (_, events) = SequenceData::parse_handy(&[0x00, 0x29, 0x01, 0x00, 0x00, 0x00, 0x00]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     assert!(matches!(
         events[0].event,
@@ -212,8 +202,7 @@ fn test_handy_note_keeps_raw_pitch_for_player_mapping() -> anyhow::Result<()> {
 
 #[test]
 fn test_mobile_reserved_status_is_ignored() -> anyhow::Result<()> {
-    let (_, events) = SequenceData::parse_mobile(&[0x00, 0xa0, 0x01, 0x02, 0x00, 0xff, 0x2f, 0x00])
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let (_, events) = SequenceData::parse_mobile(&[0x00, 0xa0, 0x01, 0x02, 0x00, 0xff, 0x2f, 0x00]).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     assert!(matches!(events[0].event, ScoreTrackSequenceEvent::Nop));
 

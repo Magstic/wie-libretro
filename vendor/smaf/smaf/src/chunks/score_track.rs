@@ -60,16 +60,49 @@ impl<'a> Parse<&'a [u8]> for PCMDataChunk<'a> {
 }
 
 pub enum ScoreTrackSequenceEvent {
-    NoteMessage { channel: u8, note: u8, velocity: Option<u8>, gate_time: u32 },
-    ControlChange { channel: u8, control: u8, value: u8 },
-    ProgramChange { channel: u8, program: u8 },
-    BankSelect { channel: u8, value: u8 },
-    OctaveShift { channel: u8, value: u8 },
-    Modulation { channel: u8, value: u8 },
-    PitchBend { channel: u8, value: u16 },
-    Volume { channel: u8, value: u8 },
-    Pan { channel: u8, value: u8 },
-    Expression { channel: u8, value: u8 },
+    NoteMessage {
+        channel: u8,
+        note: u8,
+        velocity: Option<u8>,
+        gate_time: u32,
+    },
+    ControlChange {
+        channel: u8,
+        control: u8,
+        value: u8,
+    },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
+    BankSelect {
+        channel: u8,
+        value: u8,
+    },
+    OctaveShift {
+        channel: u8,
+        value: u8,
+    },
+    Modulation {
+        channel: u8,
+        value: u8,
+    },
+    PitchBend {
+        channel: u8,
+        value: u16,
+    },
+    Volume {
+        channel: u8,
+        value: u8,
+    },
+    Pan {
+        channel: u8,
+        value: u8,
+    },
+    Expression {
+        channel: u8,
+        value: u8,
+    },
     Exclusive(Vec<u8>),
     Nop,
 }
@@ -182,8 +215,6 @@ impl SequenceData {
                         });
 
                         break;
-                    } else if second_byte == 0x00 {
-                        ScoreTrackSequenceEvent::Nop
                     } else {
                         ScoreTrackSequenceEvent::Nop
                     }
@@ -248,13 +279,8 @@ impl SequenceData {
                     let event_type = next_byte & 0b0011_1111;
 
                     if event_type == 0x00 {
-                        if softbank {
-                            let (remaining, _value) = u8(remaining)?;
-                            data = remaining;
-                        } else {
-                            let (remaining, _end_check) = u8(remaining)?;
-                            data = remaining;
-                        }
+                        let (remaining, _) = u8(remaining)?;
+                        data = remaining;
                         ScoreTrackSequenceEvent::Nop
                     } else if (0x01..=0x0e).contains(&event_type) {
                         ScoreTrackSequenceEvent::Expression {
@@ -360,6 +386,7 @@ impl SequenceData {
     }
 }
 
+#[allow(clippy::let_and_return)]
 fn parse_mobile_compressed(data: &[u8]) -> IResult<&[u8], Vec<SequenceData>> {
     let (remaining, decoded_len) = be_u32(data)?;
     let decoded =

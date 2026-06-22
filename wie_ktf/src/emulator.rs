@@ -148,3 +148,9 @@ impl Emulator for KtfEmulator {
         })
     }
 }
+
+impl Drop for KtfEmulator {
+    fn drop(&mut self) {
+        self.system.shutdown();
+    }
+}

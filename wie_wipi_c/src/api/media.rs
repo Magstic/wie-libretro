@@ -80,9 +80,17 @@ struct MdaClip {
 pub async fn clip_create(context: &mut dyn WIPICContext, ptr_type: WIPICWord, buf_size: WIPICWord, callback: WIPICWord) -> Result<WIPICWord> {
     tracing::debug!("MC_mdaClipCreate({ptr_type:#x}, {buf_size:#x}, {callback:#x})");
 
-    let clip = context.alloc_raw(size_of::<MdaClip>() as u32)?;
+    let ptr_clip = context.alloc_raw(size_of::<MdaClip>() as u32)?;
+    let mut clip = MdaClip::zeroed();
+    if buf_size > 0 {
+        let sound_data = context.alloc_raw(buf_size)?;
+        clip.sound_data_saved_len = buf_size as i32;
+        clip.sound_data_len = buf_size as i32;
+        clip.sound_data = sound_data;
+    }
+    write_generic(context, ptr_clip, clip)?;
 
-    Ok(clip)
+    Ok(ptr_clip)
 }
 
 pub async fn clip_free(context: &mut dyn WIPICContext, clip: WIPICWord) -> Result<WIPICWord> {
@@ -93,8 +101,17 @@ pub async fn clip_free(context: &mut dyn WIPICContext, clip: WIPICWord) -> Resul
         return Ok(0);
     }
 
-    context.free_raw(clip, size_of::<MdaClip>() as u32)?;
+    let clip_data: MdaClip = read_generic(context, clip)?;
+    if clip_data.handle != 0
+        && let Err(err) = context.system().audio().close(clip_data.handle)
+    {
+        tracing::warn!("Failed to close audio handle {}: {err:?}", clip_data.handle);
+    }
+    if clip_data.sound_data != 0 && clip_data.sound_data_saved_len > 0 {
+        context.free_raw(clip_data.sound_data, clip_data.sound_data_saved_len as u32)?;
+    }
 
+    context.free_raw(clip, size_of::<MdaClip>() as u32)?;
     Ok(0)
 }
 
@@ -132,16 +149,23 @@ pub async fn clip_put_data(context: &mut dyn WIPICContext, ptr_clip: WIPICWord, 
     let mut data = vec![0; buf_size as _];
     context.read_bytes(buf, &mut data)?;
 
-    let handle = context.system().audio().load_smaf(&data);
-    if let Err(x) = handle {
-        tracing::error!("Failed to load audio: {x:?}");
-        return Ok(0);
-    }
-
-    let handle = handle.unwrap();
-
     let mut clip: MdaClip = read_generic(context, ptr_clip)?;
-    clip.handle = handle;
+    if clip.handle != 0
+        && let Err(err) = context.system().audio().close(clip.handle)
+    {
+        tracing::warn!("Failed to close previous audio handle {}: {err:?}", clip.handle);
+    }
+    clip.handle = 0;
+    replace_clip_sound_data(context, &mut clip, &data)?;
+
+    let loaded = context.system().audio().load_smaf(&data);
+    match loaded {
+        Ok(handle) => clip.handle = handle,
+        Err(err) => {
+            tracing::error!("Failed to load audio: {err:?}");
+            return Ok(0);
+        }
+    }
     write_generic(context, ptr_clip, clip)?;
 
     Ok(buf_size as _)
@@ -159,14 +183,25 @@ pub async fn clip_set_position(_context: &mut dyn WIPICContext, clip: WIPICWord,
     Ok(0)
 }
 
-pub async fn clip_get_volume(_context: &mut dyn WIPICContext, clip: WIPICWord) -> Result<WIPICWord> {
-    tracing::warn!("stub MC_mdaClipGetVolume({clip:#x})");
+pub async fn clip_get_volume(context: &mut dyn WIPICContext, clip: WIPICWord) -> Result<WIPICWord> {
+    tracing::debug!("MC_mdaClipGetVolume({clip:#x})");
+    if clip == 0 {
+        return Ok(0);
+    }
 
-    Ok(0)
+    let clip: MdaClip = read_generic(context, clip)?;
+    Ok(clip.original_volume as WIPICWord)
 }
 
-pub async fn clip_set_volume(_context: &mut dyn WIPICContext, clip: WIPICWord, volume: WIPICWord) -> Result<WIPICWord> {
-    tracing::warn!("stub MC_mdaClipSetVolume({clip:#x}, {volume:#x})");
+pub async fn clip_set_volume(context: &mut dyn WIPICContext, clip: WIPICWord, volume: WIPICWord) -> Result<WIPICWord> {
+    tracing::debug!("MC_mdaClipSetVolume({clip:#x}, {volume:#x})");
+    if clip == 0 {
+        return Ok(0);
+    }
+
+    let mut clip_data: MdaClip = read_generic(context, clip)?;
+    clip_data.original_volume = volume as i32;
+    write_generic(context, clip, clip_data)?;
 
     Ok(0)
 }
@@ -187,7 +222,6 @@ pub async fn play(context: &mut dyn WIPICContext, ptr_clip: WIPICWord, repeat: W
     let clip: MdaClip = read_generic(context, ptr_clip)?;
 
     let system = context.system();
-
     let result = system.audio().play_repeated(system, clip.handle, repeat != 0);
 
     if let Err(x) = result {
@@ -197,14 +231,15 @@ pub async fn play(context: &mut dyn WIPICContext, ptr_clip: WIPICWord, repeat: W
     Ok(0)
 }
 
-pub async fn clip_alloc_player(_context: &mut dyn WIPICContext, clip: WIPICWord, param: WIPICWord) -> Result<WIPICWord> {
-    tracing::warn!("stub MC_mdaClipAllocPlayer({clip:#x}, {param:#x})");
+pub async fn clip_alloc_player(context: &mut dyn WIPICContext, clip: WIPICWord, param: WIPICWord) -> Result<WIPICWord> {
+    tracing::debug!("MC_mdaClipAllocPlayer({clip:#x}, {param:#x})");
+    let _ = (context, clip, param);
 
     Ok(0)
 }
 
 pub async fn clip_free_player(_context: &mut dyn WIPICContext, clip: WIPICWord) -> Result<WIPICWord> {
-    tracing::warn!("stub MC_mdaClipFreePlayer({clip:#x})");
+    tracing::debug!("MC_mdaClipFreePlayer({clip:#x})");
 
     Ok(0)
 }
@@ -275,4 +310,24 @@ pub async fn unk18(_context: &mut dyn WIPICContext, clip: WIPICWord) -> Result<W
     tracing::warn!("stub MC_mdaUnk18({clip:#x})");
 
     Ok(0)
+}
+
+fn replace_clip_sound_data(context: &mut dyn WIPICContext, clip: &mut MdaClip, data: &[u8]) -> Result<()> {
+    if data.is_empty() {
+        clip.sound_data_len = 0;
+        return Ok(());
+    }
+
+    let needs_new_buffer = clip.sound_data == 0 || clip.sound_data_saved_len <= 0 || data.len() > clip.sound_data_saved_len as usize;
+    if needs_new_buffer {
+        if clip.sound_data != 0 && clip.sound_data_saved_len > 0 {
+            context.free_raw(clip.sound_data, clip.sound_data_saved_len as u32)?;
+        }
+        clip.sound_data = context.alloc_raw(data.len() as u32)?;
+        clip.sound_data_saved_len = data.len() as i32;
+    }
+
+    context.write_bytes(clip.sound_data, data)?;
+    clip.sound_data_len = data.len() as i32;
+    Ok(())
 }

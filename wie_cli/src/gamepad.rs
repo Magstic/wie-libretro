@@ -93,21 +93,19 @@ impl GamepadState {
     }
 
     fn release_gamepad_inputs(&mut self, id: GamepadId) -> Vec<GamepadCallbackEvent> {
-        let released_inputs = self
-            .pressed_inputs
-            .iter()
-            .copied()
-            .filter(|(gamepad_id, _input)| *gamepad_id == id)
-            .collect::<Vec<_>>();
-
-        for entry in &released_inputs {
-            self.pressed_inputs.remove(entry);
-        }
-
-        released_inputs
-            .into_iter()
-            .map(|(gamepad_id, input)| GamepadCallbackEvent::Keyup { id: gamepad_id, input })
-            .collect()
+        let mut events = Vec::new();
+        self.pressed_inputs.retain(|(gamepad_id, input)| {
+            if *gamepad_id == id {
+                events.push(GamepadCallbackEvent::Keyup {
+                    id: *gamepad_id,
+                    input: *input,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        events
     }
 
     fn handle_axis_change(&mut self, id: GamepadId, axis: Axis, value: f32) -> Vec<GamepadCallbackEvent> {
@@ -232,12 +230,7 @@ fn stick_axis(axis: Axis) -> Option<(StickKind, StickAxisComponent)> {
     }
 }
 
-fn resolve_stick_direction(
-    stick: StickKind,
-    x: f32,
-    y: f32,
-    current_direction: Option<GamepadAxisDirection>,
-) -> Option<GamepadAxisDirection> {
+fn resolve_stick_direction(stick: StickKind, x: f32, y: f32, current_direction: Option<GamepadAxisDirection>) -> Option<GamepadAxisDirection> {
     let magnitude = x.hypot(y);
 
     let activation_threshold = if current_direction.is_some() {

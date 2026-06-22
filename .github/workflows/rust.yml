@@ -53,6 +53,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all -- -D warnings
       - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo build -p wie_libretro --release
 
       - if: matrix.os == 'windows-latest'
         run: |

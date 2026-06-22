@@ -137,6 +137,16 @@ impl Executor {
         self.inner.lock().current_task_id.unwrap() as _
     }
 
+    pub fn clear(&self) {
+        let (tasks, sleeping_tasks) = {
+            let mut inner = self.inner.lock();
+            inner.current_task_id = None;
+            (core::mem::take(&mut inner.tasks), core::mem::take(&mut inner.sleeping_tasks))
+        };
+        drop(tasks);
+        drop(sleeping_tasks);
+    }
+
     fn step(&mut self, now: Instant) -> Result<()> {
         self.inner.lock().last_now = now;
 
@@ -198,5 +208,29 @@ impl Executor {
         }
 
         unsafe { Waker::from_raw(noop_raw_waker()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use super::Executor;
+
+    #[test]
+    fn clear_drops_pending_tasks() {
+        let captured = Arc::new(());
+        let weak = Arc::downgrade(&captured);
+        let executor = Executor::new();
+
+        executor.spawn(move || async move {
+            let _captured = captured;
+            core::future::pending::<()>().await;
+            Ok(())
+        });
+
+        executor.clear();
+
+        assert!(weak.upgrade().is_none());
     }
 }

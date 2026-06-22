@@ -135,6 +135,12 @@ impl Emulator for SktEmulator {
     }
 }
 
+impl Drop for SktEmulator {
+    fn drop(&mut self) {
+        self.system.shutdown();
+    }
+}
+
 struct SktMsd {
     id: String,
     main_class: String,

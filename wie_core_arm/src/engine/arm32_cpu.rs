@@ -1,5 +1,5 @@
-use alloc::{boxed::Box, format};
-use core::{array, mem::size_of};
+use alloc::{boxed::Box, format, vec, vec::Vec};
+use core::mem::size_of;
 
 use arm32_cpu::{Cpu, Memory, Mode, reg};
 
@@ -139,15 +139,16 @@ const PAGE_MASK: u32 = (PAGE_SIZE - 1) as _;
 const PAGE_COUNT: usize = (TOTAL_MEMORY / PAGE_SIZE as u64) as usize;
 
 struct EmulatedMemory {
-    mapped: [bool; PAGE_COUNT],
-    pages: [Option<Box<[u8; PAGE_SIZE]>>; PAGE_COUNT],
+    mapped: Box<[bool]>,
+    pages: Box<[Option<Box<[u8; PAGE_SIZE]>>]>,
 }
 
 impl EmulatedMemory {
     fn new() -> Self {
+        let pages: Vec<Option<Box<[u8; PAGE_SIZE]>>> = (0..PAGE_COUNT).map(|_| None).collect();
         Self {
-            mapped: [false; PAGE_COUNT],
-            pages: array::from_fn(|_| None),
+            mapped: vec![false; PAGE_COUNT].into_boxed_slice(),
+            pages: pages.into_boxed_slice(),
         }
     }
 

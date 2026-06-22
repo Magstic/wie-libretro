@@ -9,6 +9,12 @@ This project is dedicated to digital preservation and educational research. Our 
 - [Contribution guide](https://github.com/dlunch/wie/blob/main/CONTRIBUTING.md)
 - Architecture docs: [Emulator](docs/architecture.md) | [KTF](docs/ktf.md) | [LGT](docs/lgt.md)
 
+## Wie-Libretro
+
+This fork has an experimental [Libretro core](docs/libretro.md).
+
+In addition, some customizations were made to SMAF and CLI.
+
 ## Related projects
 
 - [RustJava](https://github.com/dlunch/RustJava)

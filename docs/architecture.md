@@ -164,7 +164,7 @@ The current implementation focuses on SMAF:
 - playback parses SMAF into timestamped events
 - those events are emitted to the host `AudioSink` as PCM wave playback or MIDI messages
 
-On CLI, the host implementation uses `rodio` for wave output and `midir` for MIDI output.
+On CLI, the host implementation uses `rodio` for wave output and `midir` for MIDI output. The Libretro core renders MIDI with its embedded software synthesizer and sends the mixed PCM through Libretro audio.
 
 ## Custom Supporting Libraries
 

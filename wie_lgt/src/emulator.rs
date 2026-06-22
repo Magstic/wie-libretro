@@ -141,6 +141,12 @@ impl Emulator for LgtEmulator {
     }
 }
 
+impl Drop for LgtEmulator {
+    fn drop(&mut self) {
+        self.system.shutdown();
+    }
+}
+
 // almost similar to KtfAdf.. can we merge these?
 struct LgtAppInfo {
     aid: String,

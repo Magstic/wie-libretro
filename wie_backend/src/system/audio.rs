@@ -44,11 +44,13 @@ impl Audio {
             scheduler: AudioScheduler::new(),
             files: BTreeMap::new(),
             playing: BTreeMap::new(),
-            last_audio_handle: 0,
+            last_audio_handle: 1,
         }
     }
 
     pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
+        SmafPlayer::new(data)?;
+
         let audio_handle = self.last_audio_handle;
 
         self.last_audio_handle += 1;
@@ -67,7 +69,7 @@ impl Audio {
 
     pub fn play_with_loop_count(&mut self, system: &System, audio_handle: AudioHandle, loop_count: i32) -> Result<(), AudioError> {
         let player = match self.files.get(&audio_handle) {
-            Some(AudioFile::Smaf(data)) => SmafPlayer::new(data),
+            Some(AudioFile::Smaf(data)) => SmafPlayer::new(data)?,
             None => return Err(AudioError::InvalidHandle),
         };
 
@@ -135,6 +137,16 @@ impl Audio {
 
         Ok(())
     }
+
+    pub fn shutdown(&mut self) {
+        for playback_control in self.playing.values() {
+            playback_control.stop();
+        }
+        self.playing.clear();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.scheduler.shutdown();
+    }
 }
 
 struct PlaybackControl {
@@ -162,8 +174,13 @@ pub struct SmafPlayer {
 }
 
 impl SmafPlayer {
-    pub fn new(data: &[u8]) -> Self {
-        Self { events: parse_smaf(data) }
+    pub fn new(data: &[u8]) -> Result<Self, AudioError> {
+        let events = parse_smaf(data);
+        if events.is_empty() {
+            return Err(AudioError::InvalidAudio);
+        }
+
+        Ok(Self { events })
     }
 
     fn used_midi_channels(&self) -> BTreeSet<u8> {
@@ -274,19 +291,21 @@ impl SmafPlayer {
 #[cfg(not(target_arch = "wasm32"))]
 struct AudioScheduler {
     sender: std::sync::mpsc::Sender<AudioSchedulerCommand>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 enum AudioSchedulerCommand {
     Play(NativePlayback),
     Wake,
+    Stop,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl AudioScheduler {
     fn new() -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("wie-audio-scheduler".into())
             .spawn(move || {
                 use std::sync::mpsc::RecvTimeoutError;
@@ -312,6 +331,12 @@ impl AudioScheduler {
                     match receiver.recv_timeout(timeout) {
                         Ok(AudioSchedulerCommand::Play(playback)) => playbacks.push(playback),
                         Ok(AudioSchedulerCommand::Wake) | Err(RecvTimeoutError::Timeout) => {}
+                        Ok(AudioSchedulerCommand::Stop) => {
+                            for playback in &mut playbacks {
+                                playback.finish();
+                            }
+                            return;
+                        }
                         Err(RecvTimeoutError::Disconnected) => {
                             for playback in &mut playbacks {
                                 playback.finish();
@@ -323,7 +348,10 @@ impl AudioScheduler {
             })
             .expect("failed to start audio scheduler thread");
 
-        Self { sender }
+        Self {
+            sender,
+            worker: Some(worker),
+        }
     }
 
     fn play(&self, playback: NativePlayback) -> core::result::Result<(), ()> {
@@ -332,6 +360,20 @@ impl AudioScheduler {
 
     fn wake(&self) {
         let _ = self.sender.send(AudioSchedulerCommand::Wake);
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.sender.send(AudioSchedulerCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for AudioScheduler {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -569,6 +611,15 @@ mod tests {
     }
 
     #[test]
+    fn audio_handle_zero_is_reserved() {
+        let audio = Audio::new(Box::new(RecordingSink {
+            events: Arc::new(StdMutex::new(Vec::new())),
+        }));
+
+        assert_eq!(audio.last_audio_handle, 1);
+    }
+
+    #[test]
     fn native_scheduler_dispatches_note_off_without_system_ticks() {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let sink: Arc<Box<dyn AudioSink>> = Arc::new(Box::new(RecordingSink { events: recorded.clone() }));
@@ -660,5 +711,48 @@ mod tests {
         let events = recorded.lock().unwrap();
         assert_eq!(events.last().map(|event| event.1), Some(RecordedEvent::NoteOff(0, 64)));
         assert!(events.last().unwrap().0.duration_since(stopped_at) < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn scheduler_shutdown_releases_active_note() {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<Box<dyn AudioSink>> = Arc::new(Box::new(RecordingSink { events: recorded.clone() }));
+        let control = Arc::new(PlaybackControl::new());
+        let mut scheduler = AudioScheduler::new();
+        scheduler
+            .play(playback(
+                vec![
+                    (
+                        0,
+                        SmafEvent::MidiNoteOn {
+                            channel: 0,
+                            note: 67,
+                            velocity: 100,
+                        },
+                    ),
+                    (
+                        10_000,
+                        SmafEvent::MidiNoteOff {
+                            channel: 0,
+                            note: 67,
+                            velocity: 0,
+                        },
+                    ),
+                ],
+                sink,
+                control,
+            ))
+            .unwrap();
+
+        let note_on_timeout = Instant::now() + std::time::Duration::from_secs(1);
+        while recorded.lock().unwrap().is_empty() && Instant::now() < note_on_timeout {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        scheduler.shutdown();
+
+        let events = recorded.lock().unwrap();
+        assert_eq!(events.first().map(|event| event.1), Some(RecordedEvent::NoteOn(0, 67)));
+        assert_eq!(events.last().map(|event| event.1), Some(RecordedEvent::NoteOff(0, 67)));
     }
 }
