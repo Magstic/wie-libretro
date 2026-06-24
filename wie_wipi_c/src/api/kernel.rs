@@ -288,10 +288,15 @@ fn sprintf(context: &mut dyn WIPICContext, format: &str, args: &[u32]) -> Result
                     }
                     'd' => {
                         let arg = *arg_iter.next().unwrap() as i32;
-                        if let Some('0') = flag {
-                            result += &format!("{arg:0width$}", width = width.unwrap_or(0));
-                        } else {
-                            result += &format!("{arg:width$}", width = width.unwrap_or(0));
+                        match flag {
+                            Some('0') => result += &format!("{arg:0width$}", width = width.unwrap_or(0)),
+                            Some(' ') => {
+                                if arg >= 0 {
+                                    result.push(' ');
+                                }
+                                result += &format!("{arg:width$}", width = width.unwrap_or(0));
+                            }
+                            _ => result += &format!("{arg:width$}", width = width.unwrap_or(0)),
                         }
                         break;
                     }
@@ -319,6 +324,11 @@ fn sprintf(context: &mut dyn WIPICContext, format: &str, args: &[u32]) -> Result
                         break;
                     }
                     '0' => flag = Some('0'),
+                    ' ' => {
+                        if flag.is_none() {
+                            flag = Some(' ');
+                        }
+                    }
                     '1'..='9' => {
                         if let Some(x) = width {
                             width = Some(x * 10 + c.to_digit(10).unwrap() as usize)

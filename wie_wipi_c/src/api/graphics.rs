@@ -473,7 +473,7 @@ pub async fn get_string_width(context: &mut dyn WIPICContext, font: i32, ptr_str
     if bytes.is_empty() {
         return Ok(0);
     }
-    let s = String::from_utf8_lossy(&bytes);
+    let s = encoding_rs::EUC_KR.decode(&bytes).0;
 
     Ok(string_width(&s, 10.0) as i32)
 }
@@ -497,7 +497,7 @@ pub async fn draw_string(
     let framebuffer = FrameBuffer(read_generic(context, context.data_ptr(dst)?)?);
     let gctx: WIPICGraphicsContext = read_generic(context, pgc)?;
 
-    let string = String::from_utf8_lossy(&string_bytes);
+    let string = encoding_rs::EUC_KR.decode(&string_bytes).0;
 
     let mut canvas = framebuffer.canvas(context)?;
     let color = framebuffer.pixel_to_color(gctx.fgpxl);
