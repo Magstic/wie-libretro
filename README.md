@@ -13,8 +13,6 @@ This project is dedicated to digital preservation and educational research. Our 
 
 This fork has an experimental [Libretro core](docs/libretro.md).
 
-In addition, some customizations were made to SMAF and CLI.
-
 ## Related projects
 
 - [RustJava](https://github.com/dlunch/RustJava)

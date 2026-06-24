@@ -27,7 +27,7 @@ jobs:
           restore-keys: ${{ runner.os }}-stable-coverage-build-target-
 
       - name: Install required packages
-        run: apt update;apt install -y libgtk-3-dev libasound2-dev
+        run: apt update;apt install -y libgtk-3-dev libasound2-dev libudev-dev
 
       - name: Generate code coverage
         run: |
