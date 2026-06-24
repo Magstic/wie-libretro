@@ -32,9 +32,7 @@ impl Player {
         let player = Clip::player(jvm, &clip).await?;
 
         if !player.is_null() {
-            let loop_count = if repeat { -1 } else { 1 };
-            let _: () = jvm.invoke_virtual(&player, "setLoopCount", "(I)V", (loop_count,)).await?;
-            let _: () = jvm.invoke_virtual(&player, "start", "()V", ()).await?;
+            let _: () = jvm.invoke_virtual(&player, "start", "(Z)V", (repeat,)).await?;
 
             Ok(true)
         } else {

@@ -1,3 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["smaf", "smaf_player", "smaf_cli"]
