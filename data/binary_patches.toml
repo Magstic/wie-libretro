@@ -98,6 +98,12 @@ pattern = "13 88 08 9d 33 40 5b 08 eb 18 13 80 01 31 02 32 01 9b 99 42 f4 db"
 kind = "reg_inline_blend16_mixed"
 pattern = "0a 88 05 9b 13 40 9b 08 00 93 03 9b 1a 40 00 9b 52 08 9a 18 07 9b 9a 18 00 92 6a 46 12 88 01 34 0a 80 02 31 b4 42 eb db"
 
+# DNF-style indexed sprite row: source bytes index a RGB565 palette, and one
+# transparent color preserves the existing destination pixel.
+[[entry.hook]]
+kind = "indexed_blit_8_to_16_transparent"
+pattern = "03 78 5b 00 9a 5b 2b 68 1b 6a 9a 42 00 d0 0a 80 02 31 01 30 01 3c 00 2c f2 dc"
+
 # Thumb -O0 byte copy: `*dst++ = *src++` with `dst`/`src`/`len` all on the
 # stack. Src is reached via single-instruction `SUBS R4, R7, #4` (`3c 1f`),
 # so `src_offset` is pinned.
@@ -129,3 +135,8 @@ pattern = "70 b5 0b 1c 03 43 03 22 13 40 04 1c"
 [[entry.hook]]
 kind = "strlen"
 pattern = "30 b5 03 23 03 40 04 1c 00 2b"
+
+# RVCT unsigned integer division helper. DNF spends a lot of effect time here.
+[[entry.hook]]
+kind = "u_div"
+pattern = "00 29 34 d0 01 23 00 22 10 b4 88 42 2c d3 01 24 24 07"

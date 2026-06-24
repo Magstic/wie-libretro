@@ -63,6 +63,7 @@ enum KindTag {
     Memset,
     Strcpy,
     Strlen,
+    UDiv,
     InlineCopy,
     RegInlineCopy,
     RegInlineFill16,
@@ -70,6 +71,8 @@ enum KindTag {
     RegInlineBlend16Quarter,
     RegInlineBlend16Half,
     RegInlineBlend16Mixed,
+    #[serde(rename = "indexed_blit_8_to_16_transparent")]
+    IndexedBlit8To16Transparent,
 }
 
 impl RawEntry {
@@ -220,6 +223,7 @@ fn pc_kind(raw: &RawHook, entry_name: &str) -> HookKind {
         KindTag::Memset => HookKind::Memset,
         KindTag::Strcpy => HookKind::Strcpy,
         KindTag::Strlen => HookKind::Strlen,
+        KindTag::UDiv => HookKind::UDiv,
         KindTag::InlineCopy => HookKind::InlineCopy(InlineCopy {
             dst_offset: raw
                 .dst_offset
@@ -245,6 +249,9 @@ fn pc_kind(raw: &RawHook, entry_name: &str) -> HookKind {
         }
         KindTag::RegInlineBlend16Half => panic!("entry {entry_name}: reg_inline_blend16_half must be pattern-based, not pc-based"),
         KindTag::RegInlineBlend16Mixed => panic!("entry {entry_name}: reg_inline_blend16_mixed must be pattern-based, not pc-based"),
+        KindTag::IndexedBlit8To16Transparent => {
+            panic!("entry {entry_name}: indexed_blit_8_to_16_transparent must be pattern-based, not pc-based")
+        }
     }
 }
 
@@ -254,6 +261,7 @@ fn pattern_template(raw: &RawHook, tokens: &[PatternToken], entry_name: &str) ->
         KindTag::Memset => PatternHookKind::Memset,
         KindTag::Strcpy => PatternHookKind::Strcpy,
         KindTag::Strlen => PatternHookKind::Strlen,
+        KindTag::UDiv => PatternHookKind::UDiv,
         KindTag::RegInlineCopy => {
             let need = |cap: CaptureName, label: &str| {
                 if !tokens.iter().any(|t| match t {
@@ -277,6 +285,7 @@ fn pattern_template(raw: &RawHook, tokens: &[PatternToken], entry_name: &str) ->
         KindTag::RegInlineBlend16Quarter => PatternHookKind::RegInlineBlend16Quarter,
         KindTag::RegInlineBlend16Half => PatternHookKind::RegInlineBlend16Half,
         KindTag::RegInlineBlend16Mixed => PatternHookKind::RegInlineBlend16Mixed,
+        KindTag::IndexedBlit8To16Transparent => PatternHookKind::IndexedBlit8To16Transparent,
         KindTag::InlineCopy => {
             let exit_cap = tokens.iter().any(|t| matches!(t, PatternToken::Capture(CaptureName::ExitB)));
             if !exit_cap && raw.exit_pc.is_none() {

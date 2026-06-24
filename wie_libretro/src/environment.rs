@@ -18,12 +18,14 @@ const C_EMPTY: &[u8] = b"\0";
 const C_VIDEO: &[u8] = b"video\0";
 const C_AUDIO: &[u8] = b"audio\0";
 const C_SYSTEM: &[u8] = b"system\0";
+const C_PERFORMANCE: &[u8] = b"performance\0";
 
 const C_WIE_RESOLUTION: &[u8] = b"wie_resolution\0";
 const C_WIE_RUNTIME: &[u8] = b"wie_runtime\0";
 const C_WIE_MIDI: &[u8] = b"wie_midi\0";
 const C_WIE_MIDI_VOLUME: &[u8] = b"wie_midi_volume\0";
 const C_WIE_MIDI_SOUNDFONT: &[u8] = b"wie_midi_soundfont\0";
+const C_WIE_HOOKS: &[u8] = b"wie_hooks\0";
 
 const C_128X128: &[u8] = b"128x128\0";
 const C_128X160: &[u8] = b"128x160\0";
@@ -69,6 +71,7 @@ pub struct CoreOptions {
     pub midi_enabled: bool,
     pub midi_volume: u8,
     pub sound_font_path: Option<PathBuf>,
+    pub hooks_enabled: bool,
 }
 
 impl Default for CoreOptions {
@@ -80,6 +83,7 @@ impl Default for CoreOptions {
             midi_enabled: true,
             midi_volume: 5,
             sound_font_path: None,
+            hooks_enabled: false,
         }
     }
 }
@@ -162,6 +166,8 @@ pub fn read_core_options(environ: Option<RetroEnvironmentT>) -> CoreOptions {
             options.sound_font_path = Some(path);
         }
     }
+
+    options.hooks_enabled = matches!(get_variable(environ, C_WIE_HOOKS).as_deref(), Some("on"));
 
     options
 }
@@ -247,6 +253,10 @@ fn register_core_options(environ: RetroEnvironmentT) {
                 ),
             ),
             variable_dynamic(C_WIE_MIDI_SOUNDFONT, legacy_sound_font_variable(locale, &sound_fonts)),
+            variable(
+                C_WIE_HOOKS,
+                text(locale, "Binary Hooks; off|on\0", "二进制 Hooks; off|on\0", "二進位 Hooks; off|on\0"),
+            ),
             RetroVariable {
                 key: ptr::null(),
                 value: ptr::null(),
@@ -292,18 +302,23 @@ fn v2_categories(locale: Locale) -> Vec<RetroCoreOptionV2Category> {
     vec![
         category(
             C_VIDEO,
-            text(locale, "Video\0", "视频\0", "影像\0"),
-            text(locale, "Screen size.\0", "屏幕尺寸。\0", "螢幕尺寸。\0"),
+            text(locale, "General\0", "一般\0", "常規\0"),
+            text(locale, "General settings.\0", "一般设置。\0", "常規设定。\0"),
         ),
         category(
             C_AUDIO,
             text(locale, "Audio\0", "音频\0", "音訊\0"),
-            text(locale, "Music settings.\0", "音乐设置。\0", "音樂設定。\0"),
+            text(locale, "Music settings.\0", "音频设置。\0", "音訊設定。\0"),
         ),
         category(
             C_SYSTEM,
             text(locale, "System\0", "系统\0", "系統\0"),
-            text(locale, "Content runtime selection.\0", "内容运行平台选择。\0", "內容執行平台選擇。\0"),
+            text(locale, "Content runtime selection.\0", "系统设置。\0", "系統設定。\0"),
+        ),
+        category(
+            C_PERFORMANCE,
+            text(locale, "Performance\0", "性能\0", "效能\0"),
+            text(locale, "Binary patch hooks.\0", "性能设置。\0", "效能設定。\0"),
         ),
         RetroCoreOptionV2Category {
             key: ptr::null(),
@@ -369,13 +384,13 @@ fn v2_definitions(locale: Locale, sound_fonts: &[String]) -> Vec<RetroCoreOption
         ),
         v2_option(
             C_WIE_MIDI_SOUNDFONT,
-            text(locale, "MIDI SoundFont\0", "MIDI 音色库\0", "MIDI 音色庫\0"),
-            text(locale, "SoundFont\0", "音色库\0", "音色庫\0"),
+            text(locale, "MIDI SoundFont\0", "MIDI 音源\0", "MIDI 音源\0"),
+            text(locale, "SoundFont\0", "音源\0", "音源\0"),
             text(
                 locale,
-                "SF2 file from system/wie/sf2. Requires reload.\0",
-                "来自 system/wie/sf2 的 SF2 文件。需重载核心。\0",
-                "來自 system/wie/sf2 的 SF2 檔案。需重載核心。\0",
+                "SF2 file from RetroArch/system/wie/sf2. Requires reload.\0",
+                "来自 RetroArch/system/wie/sf2 的 SF2 文件。需重载核心。\0",
+                "來自 RetroArch/system/wie/sf2 的 SF2 檔案。需重載核心。\0",
             ),
             C_AUDIO,
             C_BUILTIN,
@@ -394,6 +409,20 @@ fn v2_definitions(locale: Locale, sound_fonts: &[String]) -> Vec<RetroCoreOption
             C_AUDIO,
             C_5,
             OptionValues::Static(MIDI_VOLUME_VALUES),
+        ),
+        v2_option(
+            C_WIE_HOOKS,
+            text(locale, "Binary Hooks\0", "二进制 Hooks\0", "二進位 Hooks\0"),
+            text(locale, "Hooks\0", "Hooks\0", "Hooks\0"),
+            text(
+                locale,
+                "Binary patches for faster memcpy/memset etc. Requires reload.\0",
+                "部分游戏可通过 Hooks 实现加速。需重载核心。\0",
+                "部分遊戲可透過 Hooks 實現加速。需重載核心。\0",
+            ),
+            C_PERFORMANCE,
+            C_OFF,
+            OptionValues::Static(on_off),
         ),
         RetroCoreOptionV2Definition {
             key: ptr::null(),
@@ -463,12 +492,12 @@ fn v1_definitions(locale: Locale, sound_fonts: &[String]) -> Vec<RetroCoreOption
         ),
         v1_option(
             C_WIE_MIDI_SOUNDFONT,
-            text(locale, "MIDI SoundFont\0", "MIDI 音色库\0", "MIDI 音色庫\0"),
+            text(locale, "MIDI SoundFont\0", "MIDI 音源\0", "MIDI 音源\0"),
             text(
                 locale,
-                "SF2 file from system/wie/sf2. Requires reload.\0",
-                "来自 system/wie/sf2 的 SF2 文件。需重载核心。\0",
-                "來自 system/wie/sf2 的 SF2 檔案。需重載核心。\0",
+                "SF2 file from RetroArch/system/wie/sf2. Requires reload.\0",
+                "来自 RetroArch/system/wie/sf2 的 SF2 文件。需重载核心。\0",
+                "來自 RetroArch/system/wie/sf2 的 SF2 檔案。需重載核心。\0",
             ),
             C_BUILTIN,
             OptionValues::Dynamic(sound_font_values(locale, sound_fonts)),
@@ -484,6 +513,18 @@ fn v1_definitions(locale: Locale, sound_fonts: &[String]) -> Vec<RetroCoreOption
             ),
             C_5,
             OptionValues::Static(MIDI_VOLUME_VALUES),
+        ),
+        v1_option(
+            C_WIE_HOOKS,
+            text(locale, "Binary Hooks\0", "二进制 Hooks\0", "二進位 Hooks\0"),
+            text(
+                locale,
+                "Binary patches for faster memcpy/memset etc. Requires reload.\0",
+                "部分游戏可通过 Hooks 实现加速。需重载核心。\0",
+                "部分遊戲可透過 Hooks 實現加速。需重載核心。\0",
+            ),
+            C_OFF,
+            OptionValues::Static(on_off),
         ),
         RetroCoreOptionDefinition {
             key: ptr::null(),

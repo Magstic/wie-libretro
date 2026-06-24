@@ -24,6 +24,8 @@ pub enum HookKind {
     Strcpy,
     /// ABI: str=r0; returns length in R0 via LR.
     Strlen,
+    /// ABI: numerator=r0, denominator=r1; returns quotient in R0 via LR.
+    UDiv,
     /// Replaces an inline byte-copy loop. Requires a down-counter `len` on the
     /// stack — zeroing it has to terminate the loop, so up-counter (`for i = 0;
     /// i < N`) shapes are not compatible.
@@ -48,6 +50,9 @@ pub enum HookKind {
     /// RGB565 mixed blend using masks at SP+0x14/SP+0x0c and a source
     /// contribution at SP+0x1c.
     RegInlineBlend16Mixed(RegInlineRaster16),
+    /// DNF-style 8-bit indexed sprite row: src=R0, dst=R1, count=R4,
+    /// object=R5, palette=R6. Transparent palette entries are skipped.
+    IndexedBlit8To16Transparent(IndexedBlit8To16Transparent),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +90,11 @@ pub struct RegInlineRaster16 {
     exit_pc: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IndexedBlit8To16Transparent {
+    exit_pc: u32,
+}
+
 /// Scanned across the install-time memory range; each match becomes a `Hook`.
 pub struct PatternHook {
     pub tokens: Vec<PatternToken>,
@@ -96,6 +106,7 @@ pub enum PatternHookKind {
     Memset,
     Strcpy,
     Strlen,
+    UDiv,
     InlineCopy {
         /// `None` => filled from the matching `{dst}` / `{src}` / `{len}`
         /// capture (Thumb1 `SUBS Rn, #imm8` byte, negated to a stack offset).
@@ -121,6 +132,7 @@ pub enum PatternHookKind {
     RegInlineBlend16Quarter,
     RegInlineBlend16Half,
     RegInlineBlend16Mixed,
+    IndexedBlit8To16Transparent,
 }
 
 /// Expand static + pattern hooks into a single `Vec<Hook>` whose PCs are final
@@ -149,6 +161,7 @@ pub fn resolve_hooks(core: &mut ArmCore, entry: &Entry, scan_ranges: &[(u32, u32
                 PatternHookKind::Memset => HookKind::Memset,
                 PatternHookKind::Strcpy => HookKind::Strcpy,
                 PatternHookKind::Strlen => HookKind::Strlen,
+                PatternHookKind::UDiv => HookKind::UDiv,
                 PatternHookKind::InlineCopy {
                     dst_offset,
                     src_offset,
@@ -219,6 +232,9 @@ pub fn resolve_hooks(core: &mut ArmCore, entry: &Entry, scan_ranges: &[(u32, u32
                     exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
                 }),
                 PatternHookKind::RegInlineBlend16Mixed => HookKind::RegInlineBlend16Mixed(RegInlineRaster16 {
+                    exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
+                }),
+                PatternHookKind::IndexedBlit8To16Transparent => HookKind::IndexedBlit8To16Transparent(IndexedBlit8To16Transparent {
                     exit_pc: match_addr.wrapping_add(pattern.tokens.len() as u32) | 1,
                 }),
             };
@@ -340,6 +356,16 @@ async fn handle_binary_patch_svc(core: &mut ArmCore, registry: &mut Registry) ->
             let len = stdlib::strlen(core, &mut (), s).await?;
             tracing::trace!("hook strlen(ptr_str={s:#x}) -> {len:#x}");
             core.inner.lock().engine.reg_write(ArmRegister::R0, len);
+            Ok(JumpTo(lr))
+        }
+        HookKind::UDiv => {
+            let (numerator, denominator) = {
+                let inner = core.inner.lock();
+                (inner.engine.reg_read(ArmRegister::R0), inner.engine.reg_read(ArmRegister::R1))
+            };
+            let quotient = numerator.checked_div(denominator).unwrap_or(0);
+            tracing::trace!("hook udiv({numerator:#x}, {denominator:#x}) -> {quotient:#x}");
+            core.inner.lock().engine.reg_write(ArmRegister::R0, quotient);
             Ok(JumpTo(lr))
         }
         HookKind::InlineCopy(spec) => {
@@ -561,6 +587,48 @@ async fn handle_binary_patch_svc(core: &mut ArmCore, registry: &mut Registry) ->
             inner.engine.reg_write(ArmRegister::R3, contribution);
             Ok(JumpTo(spec.exit_pc))
         }
+        HookKind::IndexedBlit8To16Transparent(spec) => {
+            let (src, dst, count_initial, object, palette) = {
+                let inner = core.inner.lock();
+                (
+                    inner.engine.reg_read(ArmRegister::R0),
+                    inner.engine.reg_read(ArmRegister::R1),
+                    inner.engine.reg_read(ArmRegister::R4),
+                    inner.engine.reg_read(ArmRegister::R5),
+                    inner.engine.reg_read(ArmRegister::R6),
+                )
+            };
+            let count = if (count_initial as i32) > 0 { count_initial } else { 0 };
+            let byte_len = count
+                .checked_mul(2)
+                .ok_or_else(|| WieError::FatalError(format!("indexed_blit_8_to_16 length overflow: {count:#x}")))?;
+            let object_data: u32 = read_generic(core, object)?;
+            let transparent: u32 = read_generic(core, object_data.wrapping_add(0x20))?;
+            let mut src_data = alloc::vec![0u8; count as usize];
+            let mut dst_data = alloc::vec![0u8; byte_len as usize];
+            let mut palette_data = alloc::vec![0u8; 512];
+            core.read_bytes(src, &mut src_data)?;
+            core.read_bytes(dst, &mut dst_data)?;
+            core.read_bytes(palette, &mut palette_data)?;
+            for (i, idx) in src_data.into_iter().enumerate() {
+                let p = idx as usize * 2;
+                let color = u16::from_le_bytes([palette_data[p], palette_data[p + 1]]);
+                if color as u32 != transparent {
+                    dst_data[i * 2..i * 2 + 2].copy_from_slice(&color.to_le_bytes());
+                }
+            }
+            core.write_bytes(dst, &dst_data)?;
+
+            tracing::trace!(
+                "hook indexed_blit_8_to_16_transparent(src={src:#x}, dst={dst:#x}, count={count:#x}, exit={:#x})",
+                spec.exit_pc
+            );
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R0, src.wrapping_add(count));
+            inner.engine.reg_write(ArmRegister::R1, dst.wrapping_add(byte_len));
+            inner.engine.reg_write(ArmRegister::R4, 0);
+            Ok(JumpTo(spec.exit_pc))
+        }
     }
 }
 
@@ -756,6 +824,27 @@ mod tests {
     }
 
     #[futures_test::test]
+    async fn udiv_dispatch_returns_quotient_in_r0() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        let hook_pc = 0x10001u32;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R0, 100);
+            inner.engine.reg_write(ArmRegister::R1, 7);
+            inner.engine.reg_write(ArmRegister::LR, 0x1234);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::UDiv);
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R0), 14);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), 0x1234);
+        Ok(())
+    }
+
+    #[futures_test::test]
     async fn inline_copy_dispatch_reads_frame_copies_and_jumps_to_exit() -> Result<()> {
         let mut core = ArmCore::new(false, None)?;
         core.map(0x10000, 0x2000)?;
@@ -800,6 +889,48 @@ mod tests {
         assert_eq!(u32::from_le_bytes(slot), 0);
 
         assert_eq!(core.inner.lock().engine.reg_read(ArmRegister::PC), 0x10400);
+        Ok(())
+    }
+
+    #[futures_test::test]
+    async fn indexed_blit_8_to_16_transparent_dispatch_preserves_transparent_pixels() -> Result<()> {
+        let mut core = ArmCore::new(false, None)?;
+        core.map(0x10000, 0x4000)?;
+
+        let src = 0x10000u32;
+        let dst = 0x10100u32;
+        let palette = 0x10200u32;
+        let object = 0x11000u32;
+        let object_data = 0x11100u32;
+        let hook_pc = 0x10401u32;
+        let exit_pc = 0x1041bu32;
+        core.write_bytes(src, &[0, 1, 2, 1])?;
+        core.write_bytes(dst, &[0xaa; 8])?;
+        core.write_bytes(palette, &[0x11, 0x11, 0x22, 0x22, 0x33, 0x33])?;
+        core.write_bytes(object, &object_data.to_le_bytes())?;
+        core.write_bytes(object_data + 0x20, &0x2222u32.to_le_bytes())?;
+        {
+            let mut inner = core.inner.lock();
+            inner.engine.reg_write(ArmRegister::R0, src);
+            inner.engine.reg_write(ArmRegister::R1, dst);
+            inner.engine.reg_write(ArmRegister::R4, 4);
+            inner.engine.reg_write(ArmRegister::R5, object);
+            inner.engine.reg_write(ArmRegister::R6, palette);
+        }
+        set_post_svc_pc(&mut core, hook_pc);
+
+        let registry = registry_with(hook_pc, HookKind::IndexedBlit8To16Transparent(IndexedBlit8To16Transparent { exit_pc }));
+        RegisteredFunctionHolder::new(handle_binary_patch_svc, &registry).call(&mut core).await?;
+
+        let mut out = [0u8; 8];
+        core.read_bytes(dst, &mut out)?;
+        assert_eq!(out, [0x11, 0x11, 0xaa, 0xaa, 0x33, 0x33, 0xaa, 0xaa]);
+
+        let inner = core.inner.lock();
+        assert_eq!(inner.engine.reg_read(ArmRegister::R0), src + 4);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R1), dst + 8);
+        assert_eq!(inner.engine.reg_read(ArmRegister::R4), 0);
+        assert_eq!(inner.engine.reg_read(ArmRegister::PC), exit_pc & !1);
         Ok(())
     }
 

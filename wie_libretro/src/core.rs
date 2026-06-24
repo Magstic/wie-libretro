@@ -93,6 +93,7 @@ impl LibretroCore {
             shared.clone(),
             callbacks.log,
         ));
+        wie_core_arm::set_hooks_enabled(options.hooks_enabled);
         let emulator = load_emulator(platform, &content, options.runtime)?;
 
         let (tx, rx) = mpsc::channel();
@@ -185,11 +186,16 @@ impl LibretroCore {
             self.shared.midi.set_enabled(new_options.midi_enabled);
         }
 
+        if self.options.hooks_enabled != new_options.hooks_enabled {
+            wie_core_arm::set_hooks_enabled(new_options.hooks_enabled);
+        }
+
         if self.options.width != new_options.width
             || self.options.height != new_options.height
             || self.options.runtime != new_options.runtime
             || self.options.midi_volume != new_options.midi_volume
             || self.options.sound_font_path != new_options.sound_font_path
+            || self.options.hooks_enabled != new_options.hooks_enabled
         {
             callbacks.log.write(
                 crate::ffi::RETRO_LOG_WARN,

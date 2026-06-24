@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-hooks = ["wie_ktf/hooks", "wie_lgt/hooks"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -16,8 +14,9 @@ rustysynth = "1.3.6"
 tracing = { workspace = true }
 
 wie_backend = { workspace = true }
+wie_core_arm = { workspace = true }
 wie_j2me = { workspace = true }
-wie_ktf = { workspace = true }
-wie_lgt = { workspace = true }
+wie_ktf = { workspace = true, features = ["hooks"] }
+wie_lgt = { workspace = true, features = ["hooks"] }
 wie_skt = { workspace = true }
 wie_util = { workspace = true }
