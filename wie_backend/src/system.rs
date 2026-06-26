@@ -61,6 +61,7 @@ impl System {
     }
 
     pub fn shutdown(&self) {
+        self.audio.write().shutdown();
         self.executor.clear();
     }
 

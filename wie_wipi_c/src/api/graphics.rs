@@ -4,7 +4,7 @@ mod image;
 
 use core::mem::size_of;
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 
 use wie_backend::{
     Event,
