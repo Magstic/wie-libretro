@@ -214,8 +214,11 @@ impl SoftwareMidiSynth {
     fn new(sound_font_path: Option<&PathBuf>, volume: u8) -> Option<Self> {
         let custom_sound_font = sound_font_path.and_then(|path| fs::read(path).ok());
         let sound_font = if let Some(custom_sound_font) = custom_sound_font {
-            let mut sound_font_data = std::io::Cursor::new(custom_sound_font.as_slice());
-            SoundFont::new(&mut sound_font_data).ok()
+            load_sound_font(&custom_sound_font).or_else(|| {
+                let mut patched = custom_sound_font;
+                patch_sound_font(&mut patched);
+                load_sound_font(&patched)
+            })
         } else {
             None
         };
@@ -265,6 +268,134 @@ impl SoftwareMidiSynth {
             frame[1] = mix_i16_f32(frame[1], *right * self.gain);
         }
     }
+}
+
+fn load_sound_font(data: &[u8]) -> Option<SoundFont> {
+    SoundFont::new(&mut std::io::Cursor::new(data)).ok()
+}
+
+fn patch_sound_font(data: &mut Vec<u8>) {
+    patch_empty_presets(data);
+    patch_sample_loops(data);
+}
+
+fn patch_empty_presets(data: &mut Vec<u8>) -> Option<()> {
+    const PHDR_SIZE: usize = 38;
+
+    let (pdta_offset, pdta_start, pdta_end) = find_list(data, b"pdta")?;
+    let (phdr_offset, phdr_start, phdr_size) = find_chunk(data, pdta_start + 4, pdta_end, b"phdr")?;
+    if phdr_size % PHDR_SIZE != 0 {
+        return None;
+    }
+
+    let count = phdr_size / PHDR_SIZE;
+    let mut phdr = Vec::with_capacity(phdr_size);
+    for index in 0..count {
+        let record = phdr_start + index * PHDR_SIZE;
+        if index + 1 == count || read_u16(data, record + 24)? < read_u16(data, record + PHDR_SIZE + 24)? {
+            phdr.extend_from_slice(&data[record..record + PHDR_SIZE]);
+        }
+    }
+
+    let delta = phdr_size.checked_sub(phdr.len())?;
+    if delta == 0 {
+        return Some(());
+    }
+
+    data.splice(phdr_start..phdr_start + phdr_size, phdr);
+    write_u32(data, phdr_offset + 4, (phdr_size - delta) as u32)?;
+    let pdta_size = read_u32(data, pdta_offset + 4)?.checked_sub(delta as u32)?;
+    let riff_size = read_u32(data, 4)?.checked_sub(delta as u32)?;
+    write_u32(data, pdta_offset + 4, pdta_size)?;
+    write_u32(data, 4, riff_size)?;
+    Some(())
+}
+
+fn patch_sample_loops(data: &mut [u8]) -> Option<()> {
+    const SHDR_SIZE: usize = 46;
+
+    let (_, sdta_start, sdta_end) = find_list(data, b"sdta")?;
+    let (_, _, smpl_size) = find_chunk(data, sdta_start + 4, sdta_end, b"smpl")?;
+    let sample_count = (smpl_size / 2) as u32;
+
+    let (_, pdta_start, pdta_end) = find_list(data, b"pdta")?;
+    let (_, shdr_start, shdr_size) = find_chunk(data, pdta_start + 4, pdta_end, b"shdr")?;
+    if shdr_size < SHDR_SIZE || shdr_size % SHDR_SIZE != 0 || sample_count == 0 {
+        return None;
+    }
+
+    for record in (shdr_start..shdr_start + shdr_size - SHDR_SIZE).step_by(SHDR_SIZE) {
+        let mut start = read_u32(data, record + 20)?;
+        let end = read_u32(data, record + 24)?.min(sample_count);
+        let mut start_loop = read_u32(data, record + 28)?;
+        let mut end_loop = read_u32(data, record + 32)?;
+        if end == 0 {
+            continue;
+        }
+
+        start = start.min(end - 1);
+        if end_loop <= start_loop {
+            start_loop = start;
+            end_loop = end;
+        }
+        start_loop = start_loop.clamp(start, end - 1);
+        end_loop = end_loop.clamp(start_loop + 1, end);
+
+        write_u32(data, record + 20, start)?;
+        write_u32(data, record + 24, end)?;
+        write_u32(data, record + 28, start_loop)?;
+        write_u32(data, record + 32, end_loop)?;
+    }
+
+    Some(())
+}
+
+fn find_list(data: &[u8], list_type: &[u8; 4]) -> Option<(usize, usize, usize)> {
+    let mut offset = 12;
+    while offset + 12 <= data.len() {
+        let size = read_u32(data, offset + 4)? as usize;
+        let start = offset + 8;
+        let end = start.checked_add(size)?;
+        if end > data.len() {
+            return None;
+        }
+        if size >= 4 && &data[offset..offset + 4] == b"LIST" && &data[start..start + 4] == list_type {
+            return Some((offset, start, end));
+        }
+        offset = end + (size & 1);
+    }
+
+    None
+}
+
+fn find_chunk(data: &[u8], start: usize, end: usize, id: &[u8; 4]) -> Option<(usize, usize, usize)> {
+    let mut offset = start;
+    while offset + 8 <= end {
+        let size = read_u32(data, offset + 4)? as usize;
+        let payload = offset + 8;
+        if payload + size > end {
+            return None;
+        }
+        if &data[offset..offset + 4] == id {
+            return Some((offset, payload, size));
+        }
+        offset = payload + size + (size & 1);
+    }
+
+    None
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(data.get(offset..offset + 2)?.try_into().ok()?))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Option<()> {
+    data.get_mut(offset..offset + 4)?.copy_from_slice(&value.to_le_bytes());
+    Some(())
 }
 
 impl wie_backend::AudioSink for LibretroAudioSink {
@@ -436,6 +567,26 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         assert!(rendered.iter().any(|sample| *sample != 0));
+    }
+
+    #[test]
+    fn midi_output_loads_lenient_soundfonts_if_present() {
+        for path in [
+            "C:\\Users\\Magstic\\Documents\\SynthFont\\Nokia_Lloyd_Bank2.sf2",
+            "C:\\Users\\Magstic\\Documents\\SynthFont\\MCP-MA7.sf2",
+        ] {
+            let path = std::path::PathBuf::from(path);
+            if !path.exists() {
+                continue;
+            }
+
+            let midi = MidiOutput::new(true, Some(path), 5);
+            midi.note_on(0, 60, 100);
+            let mut rendered = vec![0; 4096];
+            midi.render_into(&mut rendered);
+
+            assert!(rendered.iter().any(|sample| *sample != 0));
+        }
     }
 
     #[test]
