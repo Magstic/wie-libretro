@@ -53,11 +53,14 @@ pub trait Image: Send {
 pub trait ImageBuffer: Send {
     fn put_pixel(&mut self, x: i32, y: i32, color: Color);
     fn put_pixels(&mut self, x: i32, y: i32, width: u32, colors: &[Color]);
+    fn xor_pixel(&mut self, x: i32, y: i32, color: Color);
 }
 
 #[allow(clippy::too_many_arguments)]
 pub trait Canvas: Send {
     fn image(&self) -> &dyn Image;
+    fn set_xor_mode(&mut self, xor_mode: bool);
+    fn copy_area(&mut self, dx: i32, dy: i32, sx: i32, sy: i32, w: u32, h: u32, clip: Clip);
     fn draw(&mut self, dx: i32, dy: i32, w: u32, h: u32, src: &dyn Image, sx: i32, sy: i32, clip: Clip);
     fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color);
     fn draw_text(&mut self, string: &str, x: i32, y: i32, text_alignment: TextAlignment, color: Color);
@@ -74,6 +77,7 @@ pub trait PixelType: Send {
     type DataType: Copy + Pod + Num + Send;
     fn from_color(color: Color) -> Self::DataType;
     fn to_color(raw: Self::DataType) -> Color;
+    fn xor_color(raw: Self::DataType, color: Color) -> Self::DataType;
 }
 
 pub struct Rgb332Pixel;
@@ -82,9 +86,9 @@ impl PixelType for Rgb332Pixel {
     type DataType = u8;
 
     fn from_color(color: Color) -> Self::DataType {
-        let r = (color.r * 7 + 127) / 255;
-        let g = (color.g * 7 + 127) / 255;
-        let b = (color.b * 3 + 127) / 255;
+        let r = ((color.r as u16 * 7 + 127) / 255) as u8;
+        let g = ((color.g as u16 * 7 + 127) / 255) as u8;
+        let b = ((color.b as u16 * 3 + 127) / 255) as u8;
 
         (r << 5) | (g << 2) | b
     }
@@ -100,6 +104,10 @@ impl PixelType for Rgb332Pixel {
             g: g * 36,
             b: b * 85,
         }
+    }
+
+    fn xor_color(raw: Self::DataType, color: Color) -> Self::DataType {
+        raw ^ Self::from_color(color)
     }
 }
 
@@ -127,6 +135,10 @@ impl PixelType for Rgb565Pixel {
 
         Color { a: 0xff, r, g, b }
     }
+
+    fn xor_color(raw: Self::DataType, color: Color) -> Self::DataType {
+        raw ^ Self::from_color(color)
+    }
 }
 
 pub struct Rgb8Pixel;
@@ -144,6 +156,10 @@ impl PixelType for Rgb8Pixel {
         let b = (raw & 0xff) as u8;
 
         Color { a: 0xff, r, g, b }
+    }
+
+    fn xor_color(raw: Self::DataType, color: Color) -> Self::DataType {
+        raw ^ Self::from_color(color)
     }
 }
 
@@ -164,6 +180,12 @@ impl PixelType for ArgbPixel {
 
         Color { a, r, g, b }
     }
+
+    fn xor_color(raw: Self::DataType, color: Color) -> Self::DataType {
+        let source = ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32;
+
+        (raw ^ source) | 0xff000000
+    }
 }
 
 pub struct AbgrPixel;
@@ -182,6 +204,12 @@ impl PixelType for AbgrPixel {
         let r = (raw & 0xff) as u8;
 
         Color { a, r, g, b }
+    }
+
+    fn xor_color(raw: Self::DataType, color: Color) -> Self::DataType {
+        let source = ((color.b as u32) << 16) | ((color.g as u32) << 8) | color.r as u32;
+
+        (raw ^ source) | 0xff000000
     }
 }
 
@@ -300,6 +328,15 @@ where
             }
         }
     }
+
+    fn xor_pixel(&mut self, x: i32, y: i32, color: Color) {
+        if x < 0 || y < 0 || (x as u32) >= self.width || (y as u32) >= self.height {
+            return;
+        }
+
+        let offset = ((y as u32) * self.width + (x as u32)) as usize;
+        self.data[offset] = T::xor_color(self.data[offset], color);
+    }
 }
 
 pub struct ImageBufferCanvas<T>
@@ -307,6 +344,7 @@ where
     T: ImageBuffer + Image,
 {
     image_buffer: T,
+    xor_mode: bool,
 }
 
 impl<T> ImageBufferCanvas<T>
@@ -314,7 +352,10 @@ where
     T: ImageBuffer + Image,
 {
     pub fn new(image_buffer: T) -> Self {
-        Self { image_buffer }
+        Self {
+            image_buffer,
+            xor_mode: false,
+        }
     }
 
     pub fn into_inner(self) -> T {
@@ -322,13 +363,33 @@ where
     }
 
     fn blend_pixel(&mut self, x: i32, y: i32, color: Color) {
+        self.compose_pixel(x, y, color, true);
+    }
+
+    fn compose_pixel(&mut self, x: i32, y: i32, color: Color, blend: bool) {
         if x < 0 || y < 0 || (x as u32) >= self.image_buffer.width() || (y as u32) >= self.image_buffer.height() {
             return;
         }
         if color.a == 0 {
             return;
         }
-        if color.a == 0xff {
+
+        if self.xor_mode {
+            let color = if blend && color.a < 255 {
+                Color {
+                    a: 255,
+                    r: ((color.r as u16 * color.a as u16 + 127) / 255) as u8,
+                    g: ((color.g as u16 * color.a as u16 + 127) / 255) as u8,
+                    b: ((color.b as u16 * color.a as u16 + 127) / 255) as u8,
+                }
+            } else {
+                color
+            };
+            self.image_buffer.xor_pixel(x, y, color);
+            return;
+        }
+
+        if !blend || color.a == 0xff {
             self.image_buffer.put_pixel(x, y, color);
             return;
         }
@@ -410,6 +471,42 @@ where
         &self.image_buffer
     }
 
+    fn set_xor_mode(&mut self, xor_mode: bool) {
+        self.xor_mode = xor_mode;
+    }
+
+    fn copy_area(&mut self, dx: i32, dy: i32, sx: i32, sy: i32, w: u32, h: u32, clip: Clip) {
+        let image_width = (self.image_buffer.width() as i64).min(i32::MAX as i64);
+        let image_height = (self.image_buffer.height() as i64).min(i32::MAX as i64);
+
+        let x_start = (dx as i64).max(clip.x as i64).max(0);
+        let y_start = (dy as i64).max(clip.y as i64).max(0);
+        let x_end = (dx as i64 + w as i64).min(clip.x as i64 + clip.width as i64).min(image_width);
+        let y_end = (dy as i64 + h as i64).min(clip.y as i64 + clip.height as i64).min(image_height);
+
+        if x_start >= x_end || y_start >= y_end {
+            return;
+        }
+
+        let mut pixels = Vec::with_capacity(((x_end - x_start) * (y_end - y_start)) as usize);
+        for y_dst in y_start..y_end {
+            for x_dst in x_start..x_end {
+                let x_src = sx as i64 + x_dst - dx as i64;
+                let y_src = sy as i64 + y_dst - dy as i64;
+
+                if x_src < 0 || y_src < 0 || x_src >= image_width || y_src >= image_height {
+                    continue;
+                }
+
+                pixels.push((x_dst as i32, y_dst as i32, self.image_buffer.get_pixel(x_src as i32, y_src as i32)));
+            }
+        }
+
+        for (x, y, color) in pixels {
+            self.image_buffer.put_pixel(x, y, color);
+        }
+    }
+
     fn draw(&mut self, dx: i32, dy: i32, w: u32, h: u32, src: &dyn Image, sx: i32, sy: i32, clip: Clip) {
         let clip_right = clip.x as i64 + clip.width as i64;
         let clip_bottom = clip.y as i64 + clip.height as i64;
@@ -435,7 +532,7 @@ where
             let destination_x = dx + x_start as i32;
             src.get_pixels(sx + x_start as i32, source_y, &mut source_row);
 
-            if source_row.iter().all(|color| color.a == 0xff) {
+            if !self.xor_mode && source_row.iter().all(|color| color.a == 0xff) {
                 self.image_buffer.put_pixels(destination_x, destination_y, row_width as u32, &source_row);
             } else {
                 for (column, color) in source_row.iter().enumerate() {
@@ -595,6 +692,19 @@ where
             return;
         }
 
+        if color.a == 0 {
+            return;
+        }
+
+        if self.xor_mode {
+            for y in y_start..y_end {
+                for x in x_start..x_end {
+                    self.put_pixel(x as i32, y as i32, color);
+                }
+            }
+            return;
+        }
+
         let row = vec![color; (x_end - x_start) as usize];
         for y in y_start..y_end {
             self.image_buffer.put_pixels(x_start as i32, y as i32, row.len() as u32, &row);
@@ -673,7 +783,7 @@ where
     }
 
     fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
-        self.image_buffer.put_pixel(x, y, color)
+        self.compose_pixel(x, y, color, false);
     }
 }
 
@@ -740,7 +850,7 @@ mod tests {
 
     use crate::canvas::{Clip, Image, ImageBufferCanvas};
 
-    use super::{ArgbPixel, Canvas, Color, VecImageBuffer};
+    use super::{ArgbPixel, Canvas, Color, Rgb332Pixel, VecImageBuffer};
 
     #[test]
     fn test_canvas() -> Result<()> {
@@ -858,9 +968,128 @@ mod tests {
         a: 255,
     };
 
+    const BACKGROUND: Color = Color {
+        a: 255,
+        r: 0x12,
+        g: 0x34,
+        b: 0x56,
+    };
+
+    const XOR_COLOR: Color = Color {
+        a: 255,
+        r: 0xf0,
+        g: 0x0f,
+        b: 0xaa,
+    };
+
     fn is_set(image: &impl Image, x: i32, y: i32) -> bool {
         let c = image.get_pixel(x, y);
         c.r != 0 || c.g != 0 || c.b != 0
+    }
+
+    fn assert_color(image: &dyn Image, x: i32, y: i32, expected: Color) {
+        let actual = image.get_pixel(x, y);
+        assert_eq!((actual.a, actual.r, actual.g, actual.b), (expected.a, expected.r, expected.g, expected.b));
+    }
+
+    #[test]
+    fn test_xor_mode_fill_rect_toggles_pixels() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(4, 4));
+
+        canvas.fill_rect(0, 0, 4, 4, BACKGROUND, full_clip(4));
+        canvas.set_xor_mode(true);
+        canvas.fill_rect(1, 1, 2, 2, XOR_COLOR, full_clip(4));
+
+        assert_color(
+            canvas.image(),
+            1,
+            1,
+            Color {
+                a: 255,
+                r: BACKGROUND.r ^ XOR_COLOR.r,
+                g: BACKGROUND.g ^ XOR_COLOR.g,
+                b: BACKGROUND.b ^ XOR_COLOR.b,
+            },
+        );
+        assert_color(canvas.image(), 0, 0, BACKGROUND);
+
+        canvas.fill_rect(1, 1, 2, 2, XOR_COLOR, full_clip(4));
+
+        assert_color(canvas.image(), 1, 1, BACKGROUND);
+    }
+
+    #[test]
+    fn test_xor_mode_transparent_source_is_noop() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(1, 1));
+        canvas.fill_rect(0, 0, 1, 1, BACKGROUND, full_clip(1));
+        canvas.set_xor_mode(true);
+
+        let src = VecImageBuffer::<ArgbPixel>::from_raw(1, 1, vec![0x00ff0000]);
+        canvas.draw(0, 0, 1, 1, &src, 0, 0, full_clip(1));
+
+        assert_color(canvas.image(), 0, 0, BACKGROUND);
+    }
+
+    #[test]
+    fn test_xor_mode_rgb332_toggles_native_pixel() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<Rgb332Pixel>::new(1, 1));
+        let background = Color { a: 255, r: 0, g: 0, b: 0 };
+        let source = Color { a: 255, r: 19, g: 0, b: 0 };
+
+        canvas.fill_rect(0, 0, 1, 1, background, full_clip(1));
+        canvas.set_xor_mode(true);
+        canvas.fill_rect(0, 0, 1, 1, source, full_clip(1));
+        canvas.fill_rect(0, 0, 1, 1, source, full_clip(1));
+
+        assert_color(canvas.image(), 0, 0, background);
+    }
+
+    #[test]
+    fn test_copy_area_uses_source_snapshot_for_overlap() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(4, 1));
+        let red = Color { a: 255, r: 255, g: 0, b: 0 };
+        let green = Color { a: 255, r: 0, g: 255, b: 0 };
+        let blue = Color { a: 255, r: 0, g: 0, b: 255 };
+        let black = Color { a: 255, r: 0, g: 0, b: 0 };
+
+        canvas.put_pixel(0, 0, red);
+        canvas.put_pixel(1, 0, green);
+        canvas.put_pixel(2, 0, blue);
+        canvas.put_pixel(3, 0, black);
+
+        canvas.copy_area(1, 0, 0, 0, 3, 1, full_clip(4));
+
+        assert_color(canvas.image(), 0, 0, red);
+        assert_color(canvas.image(), 1, 0, red);
+        assert_color(canvas.image(), 2, 0, green);
+        assert_color(canvas.image(), 3, 0, blue);
+    }
+
+    #[test]
+    fn test_copy_area_respects_clip() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(4, 1));
+        let red = Color { a: 255, r: 255, g: 0, b: 0 };
+        let green = Color { a: 255, r: 0, g: 255, b: 0 };
+        let blue = Color { a: 255, r: 0, g: 0, b: 255 };
+        let black = Color { a: 255, r: 0, g: 0, b: 0 };
+        let clip = Clip {
+            x: 2,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+
+        canvas.put_pixel(0, 0, red);
+        canvas.put_pixel(1, 0, green);
+        canvas.put_pixel(2, 0, blue);
+        canvas.put_pixel(3, 0, black);
+
+        canvas.copy_area(1, 0, 0, 0, 3, 1, clip);
+
+        assert_color(canvas.image(), 0, 0, red);
+        assert_color(canvas.image(), 1, 0, green);
+        assert_color(canvas.image(), 2, 0, green);
+        assert_color(canvas.image(), 3, 0, black);
     }
 
     #[test]

@@ -55,13 +55,13 @@ impl wie_backend::AudioSink for AudioSink {
         if let Some(x) = self.midi_out.as_ref() {
             let lsb = (value & 0x7f) as u8;
             let msb = ((value >> 7) & 0x7f) as u8;
-            x.lock().unwrap().send(&[0xE0 | channel_id, lsb, msb]).unwrap()
+            x.lock().unwrap().send(&[0xE0 | channel_id, lsb, msb]).unwrap();
         }
     }
 
     fn midi_sysex(&self, data: &[u8]) {
         if let Some(x) = self.midi_out.as_ref() {
-            x.lock().unwrap().send(data).unwrap()
+            let _ = x.lock().unwrap().send(data);
         }
     }
 }
