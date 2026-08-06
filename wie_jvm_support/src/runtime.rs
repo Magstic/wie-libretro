@@ -1,12 +1,14 @@
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, sync::Arc, vec::Vec};
 use core::time::Duration;
 
 use spin::Mutex;
 
 use java_runtime::{
-    File, FileDescriptorId, FileSize, FileStat, FileType, IOError, IOResult, RT_RUSTJAR, Runtime, SpawnCallback, get_runtime_class_proto,
+    File, FileDescriptorId, FileOpenOptions, FileSize, FileStat, FileType, IOError, IOResult, RT_RUSTJAR, Runtime, SpawnCallback,
+    get_runtime_class_proto,
 };
 use jvm::{ClassDefinition, Jvm, Result as JvmResult};
+use jvm_rust::{ClassDefinitionError, ClassDefinitionImpl};
 
 use wie_backend::{AsyncCallable, System};
 use wie_util::WieError;
@@ -161,7 +163,13 @@ where
             async fn call(self) -> Result<(), WieError> {
                 let result = self.callback.call().await;
                 if let Err(err) = result {
-                    return Err(JvmSupport::to_wie_err(&self.jvm, err).await);
+                    self.jvm.attach_thread(None).await.unwrap();
+
+                    let result = Err(JvmSupport::to_wie_err(&self.jvm, err).await);
+
+                    self.jvm.detach_thread().unwrap();
+
+                    return result;
                 }
 
                 Ok(())
@@ -169,6 +177,10 @@ where
         }
 
         self.system.spawn(SpawnProxy { jvm: jvm.clone(), callback });
+    }
+
+    fn exit(&self, _status: i32) {
+        self.system.platform().exit();
     }
 
     fn now(&self) -> u64 {
@@ -191,10 +203,10 @@ where
         Ok(FileDescriptorId::new(STDERR_FD))
     }
 
-    async fn open(&self, path: &str, write: bool) -> IOResult<FileDescriptorId> {
-        tracing::debug!("open({path:?}, {write:?})");
+    async fn open(&self, path: &str, options: FileOpenOptions) -> IOResult<FileDescriptorId> {
+        tracing::debug!("open({path:?}, {options:?})");
 
-        let file = FileImpl::new(self.system.clone(), path, write).await?;
+        let file = FileImpl::new(self.system.clone(), path, options).await?;
         Ok(self.file_table.lock().add(Box::new(file)))
     }
 
@@ -227,8 +239,10 @@ where
     }
 
     async fn find_rustjar_class(&self, jvm: &Jvm, classpath: &str, class: &str) -> JvmResult<Option<Box<dyn ClassDefinition>>> {
+        let class = class.replace('.', "/");
+
         if classpath == RT_RUSTJAR {
-            let proto = get_runtime_class_proto(class);
+            let proto = get_runtime_class_proto(&class);
             if let Some(proto) = proto {
                 return Ok(Some(
                     self.implementation
@@ -250,7 +264,23 @@ where
     }
 
     async fn define_class(&self, jvm: &Jvm, data: &[u8]) -> JvmResult<Box<dyn ClassDefinition>> {
-        self.implementation.define_class_java(jvm, data).await
+        match ClassDefinitionImpl::from_classfile(data) {
+            Ok(class) => Ok(Box::new(class)),
+            Err(ClassDefinitionError::InvalidClassFile) => Err(jvm.exception("java/lang/ClassFormatError", "Invalid class file").await),
+            Err(ClassDefinitionError::UnsupportedClassVersion(version)) => Err(jvm
+                .exception(
+                    "java/lang/UnsupportedClassVersionError",
+                    &format!("Unsupported class file version {version}"),
+                )
+                .await),
+            Err(ClassDefinitionError::Verification) => Err(jvm.exception("java/lang/VerifyError", "Bytecode verification failed").await),
+            Err(ClassDefinitionError::UnsupportedFeature(feature)) => Err(jvm
+                .exception(
+                    "java/lang/UnsupportedOperationException",
+                    &format!("Unsupported class file feature: {feature}"),
+                )
+                .await),
+        }
     }
 
     async fn define_array_class(&self, _jvm: &Jvm, element_type_name: &str) -> JvmResult<Box<dyn ClassDefinition>> {

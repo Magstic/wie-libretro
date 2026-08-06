@@ -50,6 +50,7 @@ struct WieCliPlatform {
     database_repository: DatabaseRepository,
     filesystem: CliFilesystem,
     vibrate_tx: Sender<(u64, u8)>,
+    midi_device: Option<usize>,
     window: WindowHandle,
 }
 
@@ -59,7 +60,7 @@ enum EmulatorCommand {
 }
 
 impl WieCliPlatform {
-    fn new(window: WindowHandle, vibrate_tx: Sender<(u64, u8)>) -> Self {
+    fn new(window: WindowHandle, vibrate_tx: Sender<(u64, u8)>, midi_device: Option<usize>) -> Self {
         let (tx, rx) = channel();
         thread::spawn(|| Self::audio_thread(rx));
 
@@ -68,6 +69,7 @@ impl WieCliPlatform {
             database_repository: DatabaseRepository::new(),
             filesystem: CliFilesystem::new(),
             vibrate_tx,
+            midi_device,
             window,
         }
     }
@@ -133,16 +135,32 @@ impl Platform for WieCliPlatform {
         let midi_out = (|| {
             let midi_out = MidiOutput::new("wie_cli")?;
             let midi_ports = midi_out.ports();
-            let out_port_index = select_midi_output_port(&midi_out, &midi_ports).ok_or_else(|| anyhow::anyhow!("No MIDI output port"))?;
-            let out_port = &midi_ports[out_port_index];
+            let port_index =
+                select_midi_output_port(&midi_out, &midi_ports, self.midi_device).ok_or_else(|| anyhow::anyhow!("No MIDI output port"))?;
+            let out_port = &midi_ports[port_index];
+            let port_name = midi_out.port_name(out_port).unwrap_or_else(|_| "<unknown>".to_string());
 
-            if let Ok(port_name) = midi_out.port_name(out_port) {
-                tracing::info!("Using MIDI output: {port_name}");
+            if let Some(requested) = self.midi_device
+                && requested != port_index
+            {
+                tracing::warn!(
+                    requested,
+                    fallback = %port_name,
+                    "Requested MIDI output index is out of range; using default"
+                );
             }
 
-            Ok::<_, Box<dyn Error>>(midi_out.connect(out_port, "wie_cli")?)
-        })()
-        .ok();
+            let connection = midi_out.connect(out_port, "wie_cli")?;
+            tracing::info!(port = %port_name, "Using MIDI output");
+            Ok::<_, Box<dyn Error>>(connection)
+        })();
+        let midi_out = match midi_out {
+            Ok(connection) => Some(connection),
+            Err(error) => {
+                tracing::warn!(%error, "MIDI output is unavailable");
+                None
+            }
+        };
 
         Box::new(AudioSink::new(midi_out, self.audio_thread_tx.clone()))
     }
@@ -170,8 +188,10 @@ impl Platform for WieCliPlatform {
     }
 }
 
-fn select_midi_output_port(midi_out: &MidiOutput, midi_ports: &[MidiOutputPort]) -> Option<usize> {
-    select_midi_output_port_by_name(midi_ports.iter().map(|port| midi_out.port_name(port).unwrap_or_default()))
+fn select_midi_output_port(midi_out: &MidiOutput, midi_ports: &[MidiOutputPort], requested: Option<usize>) -> Option<usize> {
+    requested
+        .filter(|&index| index < midi_ports.len())
+        .or_else(|| select_midi_output_port_by_name(midi_ports.iter().map(|port| midi_out.port_name(port).unwrap_or_default())))
 }
 
 fn select_midi_output_port_by_name<I, S>(port_names: I) -> Option<usize>
@@ -262,13 +282,20 @@ impl InputState {
 
 #[derive(Parser)]
 struct Args {
-    filename: String,
+    #[arg(required_unless_present = "list_midi_devices")]
+    filename: Option<String>,
     #[arg(long, default_value_t = false)]
     debug: bool,
     /// Write a flamegraph-folded sampling profile to this path (one line per
     /// flushed batch; `flamegraph.pl` aggregates duplicates).
     #[arg(long)]
     profile_out: Option<PathBuf>,
+    /// Select a MIDI output by zero-based index.
+    #[arg(long, value_name = "INDEX")]
+    midi_device: Option<usize>,
+    /// List available MIDI output devices and exit.
+    #[arg(long, conflicts_with_all = ["filename", "debug", "profile_out", "midi_device"])]
+    list_midi_devices: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -279,13 +306,27 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    if args.list_midi_devices {
+        return list_midi_devices();
+    }
+
     let profile = args.profile_out.as_ref().map(|path| profile_callback(path)).transpose()?;
     let options = Options {
         enable_gdbserver: args.debug,
         profile,
     };
+    let filename = args.filename.as_deref().ok_or_else(|| anyhow::anyhow!("filename is required"))?;
 
-    start(&args.filename, options)
+    start_with_midi_device(filename, options, args.midi_device)
+}
+
+fn list_midi_devices() -> anyhow::Result<()> {
+    let midi_out = MidiOutput::new("wie_cli")?;
+    for (index, port) in midi_out.ports().iter().enumerate() {
+        let name = midi_out.port_name(port).unwrap_or_else(|_| "<unknown>".to_string());
+        println!("{index}: {name}");
+    }
+    Ok(())
 }
 
 fn profile_callback(path: &PathBuf) -> anyhow::Result<wie_backend::ProfileCallback> {
@@ -300,6 +341,10 @@ fn profile_callback(path: &PathBuf) -> anyhow::Result<wie_backend::ProfileCallba
 }
 
 pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
+    start_with_midi_device(filename, options, None)
+}
+
+fn start_with_midi_device(filename: &str, options: Options, midi_device: Option<usize>) -> anyhow::Result<()> {
     let config_path = config_path()?;
     let config = Config::load(&config_path)?;
     let keyboard_map = config.keyboard_map().clone();
@@ -312,13 +357,13 @@ pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
             None
         }
     };
-    let window = WindowImpl::new(240, 320).unwrap(); // TODO hardcoded size
+    let window = WindowImpl::new(240, 320)?; // TODO hardcoded size
     let window_handle = window.handle();
-    let platform = Box::new(WieCliPlatform::new(window_handle.clone(), vibrate_tx));
+    let platform = Box::new(WieCliPlatform::new(window_handle.clone(), vibrate_tx, midi_device));
 
     let buf = fs::read(filename)?;
     let mut emulator: Box<dyn Emulator + Send> = if filename.ends_with("zip") {
-        let files = extract_zip(&buf).unwrap();
+        let files = extract_zip(&buf)?;
 
         if KtfEmulator::loadable_archive(&files) {
             Box::new(KtfEmulator::from_archive(platform, files, options)?)
@@ -489,7 +534,9 @@ fn handle_gamepad_event(
 
 #[cfg(test)]
 mod tests {
-    use super::select_midi_output_port_by_name;
+    use clap::Parser;
+
+    use super::{Args, select_midi_output_port_by_name};
 
     #[test]
     fn midi_output_prefers_virtual_midi_synth() {
@@ -510,5 +557,26 @@ mod tests {
         let ports: [&str; 0] = [];
 
         assert_eq!(select_midi_output_port_by_name(ports), None);
+    }
+
+    #[test]
+    fn list_midi_devices_does_not_require_filename() {
+        let args = Args::try_parse_from(["wie_cli", "--list-midi-devices"]).unwrap();
+
+        assert!(args.list_midi_devices);
+        assert!(args.filename.is_none());
+    }
+
+    #[test]
+    fn normal_run_requires_filename() {
+        assert!(Args::try_parse_from(["wie_cli"]).is_err());
+    }
+
+    #[test]
+    fn parses_midi_device_with_filename() {
+        let args = Args::try_parse_from(["wie_cli", "game.jar", "--midi-device", "1"]).unwrap();
+
+        assert_eq!(args.filename.as_deref(), Some("game.jar"));
+        assert_eq!(args.midi_device, Some(1));
     }
 }

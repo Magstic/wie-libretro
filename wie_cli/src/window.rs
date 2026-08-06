@@ -5,7 +5,12 @@ use core::{
     num::NonZeroU32,
     sync::atomic::{AtomicBool, Ordering},
 };
-use std::{fmt, sync::Mutex, time::Duration, vec};
+use std::{
+    fmt,
+    sync::{Mutex, RwLock},
+    time::Duration,
+    vec,
+};
 
 use softbuffer::{Context, Surface};
 use winit::{
@@ -19,8 +24,33 @@ use winit::{
 
 use wie_backend::{Screen, canvas::Image};
 
+const MAX_DISPLAY_DIMENSION: u32 = 4096;
+const MAX_DISPLAY_PIXELS: u32 = 4 * 1024 * 1024;
+
+fn is_valid_display_size(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= MAX_DISPLAY_DIMENSION
+        && height <= MAX_DISPLAY_DIMENSION
+        && width.checked_mul(height).is_some_and(|pixels| pixels <= MAX_DISPLAY_PIXELS)
+}
+
+fn read_display_size(display_size: &RwLock<(u32, u32)>) -> (u32, u32) {
+    *display_size.read().unwrap()
+}
+
+fn write_display_size(display_size: &RwLock<(u32, u32)>, width: u32, height: u32) -> wie_util::Result<()> {
+    let mut display_size = display_size
+        .write()
+        .map_err(|_| wie_util::WieError::FatalError("Display size lock is poisoned".into()))?;
+    *display_size = (width, height);
+
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum WindowInternalEvent {
+    Resize(u32, u32),
     RequestRedraw,
     Paint,
     Quit,
@@ -35,8 +65,7 @@ pub enum WindowCallbackEvent {
 
 #[derive(Clone)]
 pub struct WindowHandle {
-    width: u32,
-    height: u32,
+    display_size: Arc<RwLock<(u32, u32)>>,
     event_loop_proxy: EventLoopProxy<WindowInternalEvent>,
     latest_frame: Arc<Mutex<Option<Vec<u32>>>>,
     paint_event_pending: Arc<AtomicBool>,
@@ -56,6 +85,15 @@ impl WindowHandle {
 }
 
 impl Screen for WindowHandle {
+    fn resize(&self, width: u32, height: u32) -> wie_util::Result<()> {
+        if !is_valid_display_size(width, height) {
+            return Err(wie_util::WieError::FatalError(format!("Invalid display size: {width}x{height}")));
+        }
+
+        write_display_size(&self.display_size, width, height)?;
+        self.send_event(WindowInternalEvent::Resize(width, height))
+    }
+
     fn request_redraw(&self) -> wie_util::Result<()> {
         if self.redraw_event_pending.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -84,17 +122,16 @@ impl Screen for WindowHandle {
     }
 
     fn width(&self) -> u32 {
-        self.width
+        read_display_size(&self.display_size).0
     }
 
     fn height(&self) -> u32 {
-        self.height
+        read_display_size(&self.display_size).1
     }
 }
 
 pub struct WindowImpl {
-    width: u32,
-    height: u32,
+    display_size: Arc<RwLock<(u32, u32)>>,
     event_loop: EventLoop<WindowInternalEvent>,
     latest_frame: Arc<Mutex<Option<Vec<u32>>>>,
     paint_event_pending: Arc<AtomicBool>,
@@ -103,22 +140,24 @@ pub struct WindowImpl {
 
 impl WindowImpl {
     pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
+        if !is_valid_display_size(width, height) {
+            anyhow::bail!("Invalid display size: {width}x{height}");
+        }
+
         let event_loop = EventLoop::<WindowInternalEvent>::with_user_event().build()?;
 
         Ok(Self {
-            width,
-            height,
-            event_loop,
+            display_size: Arc::new(RwLock::new((width, height))),
             latest_frame: Arc::new(Mutex::new(None)),
             paint_event_pending: Arc::new(AtomicBool::new(false)),
             redraw_event_pending: Arc::new(AtomicBool::new(false)),
+            event_loop,
         })
     }
 
     pub fn handle(&self) -> WindowHandle {
         WindowHandle {
-            width: self.width,
-            height: self.height,
+            display_size: self.display_size.clone(),
             event_loop_proxy: self.event_loop.create_proxy(),
             latest_frame: self.latest_frame.clone(),
             paint_event_pending: self.paint_event_pending.clone(),
@@ -132,7 +171,8 @@ impl WindowImpl {
     {
         self.event_loop.set_control_flow(ControlFlow::Wait);
 
-        let orig_size = LogicalSize::new(self.width, self.height);
+        let (width, height) = read_display_size(&self.display_size);
+        let orig_size = LogicalSize::new(width, height);
         let mut handler = ApplicationHandlerImpl {
             window_scale: 1,
             content_size: orig_size,
@@ -144,7 +184,7 @@ impl WindowImpl {
             context: None,
             surface: None,
             callback: Box::new(callback),
-            last_frame: vec![0u32; (self.width * self.height) as usize],
+            last_frame: vec![0u32; (width * height) as usize],
             latest_frame: self.latest_frame,
             paint_event_pending: self.paint_event_pending,
             redraw_event_pending: self.redraw_event_pending,
@@ -288,6 +328,24 @@ where
         self.on_resize();
     }
 
+    fn resize_content(&mut self, width: u32, height: u32) {
+        let content_size = LogicalSize::new(width, height);
+        if self.content_size == content_size {
+            return;
+        }
+
+        self.content_size = content_size;
+        self.last_frame = vec![0u32; width as usize * height as usize];
+        self.update_scale_factor(self.window_scale);
+
+        if let Some(window) = &self.window {
+            if let Some(new_size) = window.request_inner_size(self.scaled_size) {
+                self.window_size = new_size;
+            }
+            self.on_resize();
+        }
+    }
+
     /// Updates the scaled content image surface's size.
     fn on_resize(&mut self) {
         tracing::info!(
@@ -377,6 +435,9 @@ where
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowInternalEvent) {
         match event {
+            WindowInternalEvent::Resize(width, height) => {
+                self.resize_content(width, height);
+            }
             WindowInternalEvent::RequestRedraw => {
                 self.redraw_event_pending.store(false, Ordering::Release);
                 self.window.as_ref().unwrap().request_redraw();
@@ -447,5 +508,22 @@ where
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_display_size;
+
+    #[test]
+    fn validates_display_size_bounds() {
+        assert!(is_valid_display_size(176, 220));
+        assert!(is_valid_display_size(2048, 2048));
+
+        assert!(!is_valid_display_size(0, 220));
+        assert!(!is_valid_display_size(176, 0));
+        assert!(!is_valid_display_size(4097, 1));
+        assert!(!is_valid_display_size(4096, 1025));
+        assert!(!is_valid_display_size(u32::MAX, 2));
     }
 }

@@ -13,6 +13,17 @@ This project is dedicated to digital preservation and educational research. Our 
 
 This fork has an experimental [Libretro core](docs/libretro.md).
 
+## Frontend
+
+The web and Android/iOS frontends are maintained in this repository under `wie_web` and `wie_app`.
+
+```bash
+npm install
+npm run build:dev   # development web build
+npm run build:prod  # production web build
+npm start           # web development server
+```
+
 ## Related projects
 
 - [RustJava](https://github.com/dlunch/RustJava)

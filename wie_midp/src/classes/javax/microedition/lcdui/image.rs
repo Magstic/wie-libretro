@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, boxed::Box, vec, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, format, vec, vec::Vec};
 use core::marker::PhantomData;
 
 use bytemuck::cast_vec;
@@ -113,8 +113,14 @@ impl Image {
 
         let name = JavaLangString::to_rust_string(jvm, &name).await?;
 
-        let class_loader = jvm.current_class_loader().await?;
-        let stream = JavaLangClassLoader::get_resource_as_stream(jvm, &class_loader, &name).await?.unwrap();
+        let class_loader = JavaLangClassLoader::get_system_class_loader(jvm).await?;
+        let stream = JavaLangClassLoader::get_resource_as_stream(jvm, &class_loader, &name).await?;
+        let Some(stream) = stream else {
+            let exception = jvm
+                .exception("java/io/FileNotFoundException", &format!("Resource not found: {name}"))
+                .await;
+            return Err(exception);
+        };
 
         let image_data = JavaIoInputStream::read_until_end(jvm, &stream).await?;
         let image_data_len = image_data.len() as i32;
@@ -312,10 +318,9 @@ where
     fn colors(&self) -> Vec<Color> {
         let buffer = self.raw();
 
-        buffer
-            .chunks_exact(size_of::<T::DataType>())
-            .map(|chunk| T::to_color(*bytemuck::from_bytes(chunk)))
-            .collect()
+        let data: Vec<T::DataType> = bytemuck::pod_collect_to_vec(&buffer);
+
+        data.into_iter().map(T::to_color).collect()
     }
 
     fn argb8888(&self) -> Vec<u32> {

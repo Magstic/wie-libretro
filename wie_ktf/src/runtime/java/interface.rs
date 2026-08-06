@@ -35,8 +35,8 @@ async fn handle_java_interface_svc(core: &mut ArmCore, jvm: &mut Jvm, id: SvcId)
         JavaSvcId::GetField => EmulatedFunction::call(&get_field, core, &mut ()).await?.write(core, lr),
         JavaSvcId::JbUnk4 => EmulatedFunction::call(&jb_unk4, core, &mut ()).await?.write(core, lr),
         JavaSvcId::JbUnk5 => EmulatedFunction::call(&jb_unk5, core, &mut ()).await?.write(core, lr),
-        JavaSvcId::JbUnk7 => EmulatedFunction::call(&jb_unk7, core, &mut ()).await?.write(core, lr),
-        JavaSvcId::JbUnk8 => EmulatedFunction::call(&jb_unk8, core, &mut ()).await?.write(core, lr),
+        JavaSvcId::MonitorEnter => EmulatedFunction::call(&monitor_enter, core, jvm).await?.write(core, lr),
+        JavaSvcId::JbUnk8 => EmulatedFunction::call(&monitor_exit, core, jvm).await?.write(core, lr),
         JavaSvcId::RegisterClass => EmulatedFunction::call(&register_class, core, jvm).await?.write(core, lr),
         JavaSvcId::RegisterJavaString => EmulatedFunction::call(&register_java_string, core, jvm).await?.write(core, lr),
         JavaSvcId::CallNative => EmulatedFunction::call(&call_native, core, &mut ()).await?.write(core, lr),
@@ -53,7 +53,7 @@ pub fn get_wipi_jb_interface(core: &mut ArmCore) -> Result<u32> {
         fn_get_field: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::GetField)?,
         fn_unk4: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::JbUnk4)?,
         fn_unk5: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::JbUnk5)?,
-        fn_unk7: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::JbUnk7)?,
+        fn_unk7: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::MonitorEnter)?,
         fn_unk8: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::JbUnk8)?,
         fn_register_class: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::RegisterClass)?,
         fn_register_java_string: core.make_svc_stub(SVC_CATEGORY_JAVA_INTERFACE, JavaSvcId::RegisterJavaString)?,
@@ -69,7 +69,8 @@ pub fn get_wipi_jb_interface(core: &mut ArmCore) -> Result<u32> {
 pub async fn java_class_load(core: &mut ArmCore, jvm: &mut Jvm, ptr_target: u32, ptr_name: u32) -> Result<u32> {
     tracing::trace!("load_java_class({ptr_target:#x}, {ptr_name:#x})");
 
-    let name = String::from_utf8(read_null_terminated_string_bytes(core, ptr_name)?).unwrap();
+    let name_bytes = read_null_terminated_string_bytes(core, ptr_name)?;
+    let name = encoding_rs::EUC_KR.decode(&name_bytes).0;
     let class = jvm.resolve_class(&name).await;
 
     if let Ok(x) = class {
@@ -87,21 +88,42 @@ pub async fn java_class_load(core: &mut ArmCore, jvm: &mut Jvm, ptr_target: u32,
 pub async fn java_throw(core: &mut ArmCore, jvm: &mut Jvm, ptr_error: KtfJvmWord, a1: u32) -> Result<JavaMethodResult> {
     tracing::warn!("java_throw({ptr_error:#x}, {a1})");
 
-    let error = String::from_utf8(read_null_terminated_string_bytes(core, ptr_error)?).unwrap();
+    let error_bytes = read_null_terminated_string_bytes(core, ptr_error)?;
+    let error = encoding_rs::EUC_KR.decode(&error_bytes).0;
 
-    let exception = jvm.new_class(&error, "()V", ()).await.unwrap();
+    let exception = match jvm.new_class(&error, "()V", ()).await {
+        Ok(x) => x,
+        Err(x) => return Err(JvmSupport::to_wie_err(jvm, x).await),
+    };
 
     JavaMethod::handle_exception(core, jvm, exception).await
 }
 
-fn map_jump_result(result: core::result::Result<u32, WieError>) -> Result<JavaMethodResult> {
+fn map_exception_unwind(core: &ArmCore, caller_sp: u32, context_base: u32, target: u32, next_pc: u32) -> Result<JavaMethodResult> {
+    let handler_sp: u32 = read_generic(core, context_base + 9 * 4)?;
+    tracing::trace!(
+        "Checking Java exception unwind boundary: caller_sp={caller_sp:#x}, handler_sp={handler_sp:#x}, next_pc={next_pc:#x}, target={target:#x}"
+    );
+
+    if caller_sp != handler_sp {
+        return Err(WieError::JavaExceptionUnwind {
+            context_base,
+            target,
+            next_pc,
+        });
+    }
+
+    Ok(JavaMethodResult::new(vec![context_base, target], Some(next_pc)))
+}
+
+fn map_jump_result(core: &ArmCore, caller_sp: u32, result: core::result::Result<u32, WieError>) -> Result<JavaMethodResult> {
     match result {
         Ok(result) => Ok(JavaMethodResult::new(vec![result], None)),
         Err(WieError::JavaExceptionUnwind {
             context_base,
             target,
             next_pc,
-        }) => Ok(JavaMethodResult::new(vec![context_base, target], Some(next_pc))),
+        }) => map_exception_unwind(core, caller_sp, context_base, target, next_pc),
         Err(err) => Err(err),
     }
 }
@@ -163,7 +185,9 @@ async fn java_jump_1(core: &mut ArmCore, _: &mut (), arg1: u32, address: u32) ->
         return Err(WieError::FatalError("jump native address is null".to_string()));
     }
 
-    map_jump_result(core.run_function::<u32>(address, &[arg1, 0, 0]).await)
+    let caller_sp = core.save_context().sp;
+    let result = core.run_function::<u32>(address, &[arg1, 0, 0]).await;
+    map_jump_result(core, caller_sp, result)
 }
 
 async fn register_class(core: &mut ArmCore, jvm: &mut Jvm, ptr_class: u32) -> Result<()> {
@@ -208,7 +232,7 @@ async fn register_java_string(core: &mut ArmCore, jvm: &mut Jvm, offset: u32, le
     core.read_bytes(cursor, &mut bytes)?;
     let bytes_u16 = bytes.chunks(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect::<Vec<_>>();
 
-    let rust_string = String::from_utf16(&bytes_u16).unwrap();
+    let rust_string = String::from_utf16_lossy(&bytes_u16);
 
     let instance = JavaLangString::from_rust_string(jvm, &rust_string).await.unwrap();
 
@@ -259,14 +283,20 @@ async fn jb_unk5(_: &mut ArmCore, _: &mut (), a0: u32, a1: u32) -> Result<u32> {
     Ok(0)
 }
 
-async fn jb_unk7(_: &mut ArmCore, _: &mut (), a0: u32) -> Result<u32> {
-    tracing::warn!("stub jb_unk7({a0:#x})");
+async fn monitor_enter(core: &mut ArmCore, jvm: &mut Jvm, ptr_raw: u32) -> Result<u32> {
+    tracing::debug!("monitor_enter({ptr_raw:#x})");
+
+    let instance = JavaClassInstance::from_raw(ptr_raw, core);
+    jvm.monitor_enter(&instance).await.unwrap();
 
     Ok(0)
 }
 
-async fn jb_unk8(_: &mut ArmCore, _: &mut (), a0: u32) -> Result<u32> {
-    tracing::warn!("stub jb_unk8({a0:#x})");
+async fn monitor_exit(core: &mut ArmCore, jvm: &mut Jvm, ptr_raw: u32) -> Result<u32> {
+    tracing::debug!("monitor_exit({ptr_raw:#x})");
+
+    let instance = JavaClassInstance::from_raw(ptr_raw, core);
+    jvm.monitor_exit(&instance).await.unwrap();
 
     Ok(0)
 }
@@ -279,13 +309,14 @@ async fn call_native(core: &mut ArmCore, _: &mut (), address: u32, ptr_data: u32
     }
 
     // TODO correctly figure out parameter
+    let caller_sp = core.save_context().sp;
     let result = match core.run_function::<u32>(address, &[ptr_data, ptr_data]).await {
         Ok(result) => result,
         Err(WieError::JavaExceptionUnwind {
             context_base,
             target,
             next_pc,
-        }) => return Ok(JavaMethodResult::new(vec![context_base, target], Some(next_pc))),
+        }) => return map_exception_unwind(core, caller_sp, context_base, target, next_pc),
         Err(err) => return Err(err),
     };
 
@@ -302,7 +333,9 @@ async fn java_jump_2(core: &mut ArmCore, _: &mut (), arg1: u32, arg2: u32, addre
         return Err(WieError::FatalError("jump native address is null".to_string()));
     }
 
-    map_jump_result(core.run_function::<u32>(address, &[arg1, arg2, 0]).await)
+    let caller_sp = core.save_context().sp;
+    let result = core.run_function::<u32>(address, &[arg1, arg2, 0]).await;
+    map_jump_result(core, caller_sp, result)
 }
 
 async fn java_jump_3(core: &mut ArmCore, _: &mut (), arg1: u32, arg2: u32, arg3: u32, address: u32) -> Result<JavaMethodResult> {
@@ -312,7 +345,9 @@ async fn java_jump_3(core: &mut ArmCore, _: &mut (), arg1: u32, arg2: u32, arg3:
         return Err(WieError::FatalError("jump native address is null".to_string()));
     }
 
-    map_jump_result(core.run_function::<u32>(address, &[arg1, arg2, arg3]).await)
+    let caller_sp = core.save_context().sp;
+    let result = core.run_function::<u32>(address, &[arg1, arg2, arg3]).await;
+    map_jump_result(core, caller_sp, result)
 }
 
 pub async fn java_new(core: &mut ArmCore, jvm: &mut Jvm, ptr_class: u32) -> Result<u32> {

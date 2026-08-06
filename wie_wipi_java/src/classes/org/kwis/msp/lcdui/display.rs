@@ -44,7 +44,16 @@ impl Display {
                 ),
                 JavaMethodProto::new("isDoubleBuffered", "()Z", Self::is_double_buffered, Default::default()),
                 JavaMethodProto::new("getDockedCard", "()Lorg/kwis/msp/lcdui/Card;", Self::get_docked_card, Default::default()),
+                JavaMethodProto::new(
+                    "setDockedCard",
+                    "(Lorg/kwis/msp/lcdui/Card;I)V",
+                    Self::set_docked_card,
+                    Default::default(),
+                ),
                 JavaMethodProto::new("pushCard", "(Lorg/kwis/msp/lcdui/Card;)V", Self::push_card, Default::default()),
+                JavaMethodProto::new("popCard", "()Lorg/kwis/msp/lcdui/Card;", Self::pop_card, Default::default()),
+                JavaMethodProto::new("removeCard", "(Lorg/kwis/msp/lcdui/Card;)Z", Self::remove_card, Default::default()),
+                JavaMethodProto::new("countCard", "()I", Self::count_card, Default::default()),
                 JavaMethodProto::new("removeAllCards", "()V", Self::remove_all_cards, Default::default()),
                 JavaMethodProto::new(
                     "addJletEventListener",
@@ -56,15 +65,49 @@ impl Display {
                 JavaMethodProto::new("getHeight", "()I", Self::get_height, Default::default()),
                 JavaMethodProto::new("callSerially", "(Ljava/lang/Runnable;)V", Self::call_serially, Default::default()),
                 JavaMethodProto::new(
+                    "callSerially",
+                    "(Ljava/lang/Runnable;I)V",
+                    Self::call_serially_with_timeout,
+                    Default::default(),
+                ),
+                JavaMethodProto::new("isColor", "()Z", Self::is_color, Default::default()),
+                JavaMethodProto::new("numColors", "()I", Self::num_colors, Default::default()),
+                JavaMethodProto::new("hasPointerEvents", "()Z", Self::has_pointer_events, Default::default()),
+                JavaMethodProto::new("hasPointerMotionEvents", "()Z", Self::has_pointer_motion_events, Default::default()),
+                JavaMethodProto::new("hasRepeatEvents", "()Z", Self::has_repeat_events, Default::default()),
+                JavaMethodProto::new("getKeyName", "(I)Ljava/lang/String;", Self::get_key_name, MethodAccessFlags::STATIC),
+                JavaMethodProto::new("getBitsPerPixel", "()I", Self::get_bits_per_pixel, Default::default()),
+                JavaMethodProto::new("flush", "()V", Self::flush, Default::default()),
+                JavaMethodProto::new(
+                    "removeJletEventListener",
+                    "(Lorg/kwis/msp/lcdui/JletEventListener;)V",
+                    Self::remove_jlet_event_listener,
+                    Default::default(),
+                ),
+                JavaMethodProto::new(
+                    "grabKey",
+                    "(ILorg/kwis/msp/lcdui/JletEventListener;)V",
+                    Self::grab_key,
+                    Default::default(),
+                ),
+                JavaMethodProto::new("ungrabKey", "(I)V", Self::ungrab_key, Default::default()),
+                JavaMethodProto::new(
                     "getGameAction",
                     "(I)I",
                     Self::get_game_action,
+                    MethodAccessFlags::NATIVE | MethodAccessFlags::STATIC,
+                ),
+                JavaMethodProto::new(
+                    "getKeyCode",
+                    "(I)I",
+                    Self::get_key_code,
                     MethodAccessFlags::NATIVE | MethodAccessFlags::STATIC,
                 ),
             ],
             fields: vec![
                 JavaFieldProto::new("midpDisplay", "Ljavax/microedition/lcdui/Display;", Default::default()),
                 JavaFieldProto::new("cardCanvas", "Lnet/wie/CardCanvas;", Default::default()),
+                JavaFieldProto::new("dockedCard", "Lorg/kwis/msp/lcdui/Card;", Default::default()),
             ],
             access_flags: Default::default(),
         }
@@ -131,10 +174,22 @@ impl Display {
         Ok(result)
     }
 
-    async fn get_docked_card(_: &Jvm, _: &mut WieJvmContext) -> JvmResult<ClassInstanceRef<Card>> {
-        tracing::warn!("stub org.kwis.msp.lcdui.Display::getDockedCard");
+    async fn get_docked_card(jvm: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<ClassInstanceRef<Card>> {
+        tracing::debug!("org.kwis.msp.lcdui.Display::getDockedCard({this:?})");
 
-        Ok(None.into())
+        jvm.get_field(&this, "dockedCard", "Lorg/kwis/msp/lcdui/Card;").await
+    }
+
+    async fn set_docked_card(
+        jvm: &Jvm,
+        _: &mut WieJvmContext,
+        mut this: ClassInstanceRef<Self>,
+        card: ClassInstanceRef<Card>,
+        where_: i32,
+    ) -> JvmResult<()> {
+        tracing::debug!("org.kwis.msp.lcdui.Display::setDockedCard({this:?}, {card:?}, {where_})");
+
+        jvm.put_field(&mut this, "dockedCard", "Lorg/kwis/msp/lcdui/Card;", card).await
     }
 
     async fn is_double_buffered(jvm: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<bool> {
@@ -152,6 +207,28 @@ impl Display {
         let _: () = jvm.invoke_virtual(&card_canvas, "pushCard", "(Lorg/kwis/msp/lcdui/Card;)V", (c,)).await?;
 
         Ok(())
+    }
+
+    async fn pop_card(jvm: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<ClassInstanceRef<Card>> {
+        tracing::debug!("org.kwis.msp.lcdui.Display::popCard({this:?})");
+
+        let card_canvas = jvm.get_field(&this, "cardCanvas", "Lnet/wie/CardCanvas;").await?;
+        jvm.invoke_virtual(&card_canvas, "popCard", "()Lorg/kwis/msp/lcdui/Card;", ()).await
+    }
+
+    async fn remove_card(jvm: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>, card: ClassInstanceRef<Card>) -> JvmResult<bool> {
+        tracing::debug!("org.kwis.msp.lcdui.Display::removeCard({this:?}, {card:?})");
+
+        let card_canvas = jvm.get_field(&this, "cardCanvas", "Lnet/wie/CardCanvas;").await?;
+        jvm.invoke_virtual(&card_canvas, "removeCard", "(Lorg/kwis/msp/lcdui/Card;)Z", (card,))
+            .await
+    }
+
+    async fn count_card(jvm: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<i32> {
+        tracing::debug!("org.kwis.msp.lcdui.Display::countCard({this:?})");
+
+        let card_canvas = jvm.get_field(&this, "cardCanvas", "Lnet/wie/CardCanvas;").await?;
+        jvm.invoke_virtual(&card_canvas, "countCard", "()I", ()).await
     }
 
     async fn remove_all_cards(jvm: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<()> {
@@ -201,6 +278,95 @@ impl Display {
         Ok(())
     }
 
+    async fn call_serially_with_timeout(
+        _: &Jvm,
+        _: &mut WieJvmContext,
+        this: ClassInstanceRef<Self>,
+        runnable: ClassInstanceRef<Runnable>,
+        timeout: i32,
+    ) -> JvmResult<()> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::callSerially({this:?}, {runnable:?}, {timeout})");
+
+        Ok(())
+    }
+
+    async fn is_color(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<bool> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::isColor({this:?})");
+
+        Ok(false)
+    }
+
+    async fn num_colors(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<i32> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::numColors({this:?})");
+
+        Ok(0)
+    }
+
+    async fn has_pointer_events(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<bool> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::hasPointerEvents({this:?})");
+
+        Ok(false)
+    }
+
+    async fn has_pointer_motion_events(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<bool> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::hasPointerMotionEvents({this:?})");
+
+        Ok(false)
+    }
+
+    async fn has_repeat_events(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<bool> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::hasRepeatEvents({this:?})");
+
+        Ok(false)
+    }
+
+    async fn get_key_name(_: &Jvm, _: &mut WieJvmContext, key: i32) -> JvmResult<ClassInstanceRef<String>> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::getKeyName({key})");
+
+        Ok(None.into())
+    }
+
+    async fn get_bits_per_pixel(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<i32> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::getBitsPerPixel({this:?})");
+
+        Ok(0)
+    }
+
+    async fn flush(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>) -> JvmResult<()> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::flush({this:?})");
+
+        Ok(())
+    }
+
+    async fn remove_jlet_event_listener(
+        _: &Jvm,
+        _: &mut WieJvmContext,
+        this: ClassInstanceRef<Self>,
+        listener: ClassInstanceRef<JletEventListener>,
+    ) -> JvmResult<()> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::removeJletEventListener({this:?}, {listener:?})");
+
+        Ok(())
+    }
+
+    async fn grab_key(
+        _: &Jvm,
+        _: &mut WieJvmContext,
+        this: ClassInstanceRef<Self>,
+        key: i32,
+        listener: ClassInstanceRef<JletEventListener>,
+    ) -> JvmResult<()> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::grabKey({this:?}, {key}, {listener:?})");
+
+        Ok(())
+    }
+
+    async fn ungrab_key(_: &Jvm, _: &mut WieJvmContext, this: ClassInstanceRef<Self>, key: i32) -> JvmResult<()> {
+        tracing::warn!("stub org.kwis.msp.lcdui.Display::ungrabKey({this:?}, {key})");
+
+        Ok(())
+    }
+
     async fn get_game_action(_jvm: &Jvm, _: &mut WieJvmContext, key: i32) -> JvmResult<i32> {
         tracing::debug!("org.kwis.msp.lcdui.Display::getGameAction({key})");
 
@@ -217,7 +383,76 @@ impl Display {
         Ok(action)
     }
 
+    async fn get_key_code(_jvm: &Jvm, _: &mut WieJvmContext, game_key: i32) -> JvmResult<i32> {
+        tracing::debug!("org.kwis.msp.lcdui.Display::getKeyCode({game_key})");
+
+        let key_code = match game_key {
+            1 => WIPIKeyCode::UP as i32,
+            2 => WIPIKeyCode::LEFT as i32,
+            5 => WIPIKeyCode::RIGHT as i32,
+            6 => WIPIKeyCode::DOWN as i32,
+            8 => WIPIKeyCode::FIRE as i32,
+            90 => WIPIKeyCode::LEFT_SOFT_KEY as i32,
+            91 => WIPIKeyCode::RIGHT_SOFT_KEY as i32,
+            92 => -8,
+            96 => WIPIKeyCode::VOLUME_UP as i32,
+            97 => WIPIKeyCode::VOLUME_DOWN as i32,
+            98 => -15,
+            99 => WIPIKeyCode::CLEAR as i32,
+            _ => 0,
+        };
+
+        Ok(key_code)
+    }
+
     pub async fn midp_display(jvm: &Jvm, this: &ClassInstanceRef<Self>) -> JvmResult<ClassInstanceRef<MidpDisplay>> {
         jvm.get_field(this, "midpDisplay", "Ljavax/microedition/lcdui/Display;").await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use alloc::boxed::Box;
+
+    use test_utils::run_jvm_test;
+    use wie_util::Result;
+
+    use crate::get_protos;
+
+    #[test]
+    fn test_get_key_code() -> Result<()> {
+        run_jvm_test(Box::new([wie_midp::get_protos().into(), get_protos().into()]), |jvm| async move {
+            let up: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (1,)).await?;
+            let down: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (6,)).await?;
+            let left: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (2,)).await?;
+            let right: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (5,)).await?;
+            let fire: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (8,)).await?;
+            let soft1: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (90,)).await?;
+            let soft2: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (91,)).await?;
+            let soft3: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (92,)).await?;
+            let side_up: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (96,)).await?;
+            let side_down: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (97,)).await?;
+            let side_select: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (98,)).await?;
+            let clear: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (99,)).await?;
+            let game_a: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (9,)).await?;
+            let invalid: i32 = jvm.invoke_static("org/kwis/msp/lcdui/Display", "getKeyCode", "(I)I", (1234,)).await?;
+
+            assert_eq!(up, -1);
+            assert_eq!(down, -2);
+            assert_eq!(left, -3);
+            assert_eq!(right, -4);
+            assert_eq!(fire, -5);
+            assert_eq!(soft1, -6);
+            assert_eq!(soft2, -7);
+            assert_eq!(soft3, -8);
+            assert_eq!(side_up, -13);
+            assert_eq!(side_down, -14);
+            assert_eq!(side_select, -15);
+            assert_eq!(clear, -16);
+            assert_eq!(game_a, 0);
+            assert_eq!(invalid, 0);
+
+            Ok(())
+        })
     }
 }

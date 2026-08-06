@@ -10,8 +10,6 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use futures::TryFutureExt;
-use wie_jvm_support::JvmSupport;
-
 use java_class_proto::JavaMethodProto;
 use java_constants::MethodAccessFlags;
 use jvm::{ClassInstance, JavaError, JavaType, JavaValue, Jvm, Method, Result as JvmResult};
@@ -24,12 +22,13 @@ use alloc::sync::Arc;
 use wie_core_arm::{
     Allocator, ArmCore, EmulatedFunction, EmulatedFunctionParam, RUN_FUNCTION_LR, RegisteredFunction, RegisteredFunctionHolder, ResultWriter,
 };
+use wie_jvm_support::native::{NativeJavaValueCodec, decode_method_arguments, encode_method_arguments, method_argument_word_count};
 use wie_util::{ByteWrite, Result, WieError, read_generic, write_generic};
 
 use crate::runtime::java::jvm_support::JavaClassDefinition;
 use crate::runtime::{SVC_CATEGORY_JAVA, java::JavaSvcFunctions};
 
-use super::{KtfJvmSupport, class_instance::JavaClassInstance, name::JavaFullName, value::JavaValueExt};
+use super::{KtfJvmSupport, class_instance::JavaClassInstance, name::JavaFullName, value::JavaValueCodec};
 
 pub struct JavaMethod {
     pub ptr_raw: u32,
@@ -123,16 +122,8 @@ impl JavaMethod {
 
         let mut core = self.core.clone();
 
-        let mut raw_args = Vec::with_capacity(args.len());
-        for arg in args.iter() {
-            if matches!(arg, JavaValue::Double(_) | JavaValue::Long(_)) {
-                let (arg, arg_high) = arg.as_raw64();
-                raw_args.push(arg);
-                raw_args.push(arg_high);
-            } else {
-                raw_args.push(arg.as_raw());
-            }
-        }
+        let codec = JavaValueCodec::new(&self.core);
+        let raw_args = encode_method_arguments(&codec, &args);
 
         struct JavaMethodRunResult {
             result: u32,
@@ -154,9 +145,14 @@ impl JavaMethod {
         // mirrors the trampoline path in `interface.rs::map_jump_result`, but for the
         // outermost frame whose caller is the Rust JVM rather than another ARM trampoline.
         async fn run_with_unwind(core: &mut ArmCore, mut pc: u32, mut args: Vec<u32>) -> Result<JavaMethodRunResult> {
+            let caller_context = core.save_context();
+
             loop {
                 match core.run_function::<JavaMethodRunResult>(pc, &args).await {
-                    Ok(r) => return Ok(r),
+                    Ok(r) => {
+                        core.restore_context(&caller_context);
+                        return Ok(r);
+                    }
                     Err(WieError::JavaExceptionUnwind {
                         context_base,
                         target,
@@ -166,7 +162,10 @@ impl JavaMethod {
                         pc = next_pc;
                         args = vec![context_base, target];
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        core.restore_context(&caller_context);
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -192,9 +191,9 @@ impl JavaMethod {
         };
 
         if matches!(return_type, JavaType::Double | JavaType::Long) {
-            Ok(JavaValue::from_raw64(result.result, result.result_high, &return_type))
+            Ok(codec.decode_wide(result.result, result.result_high, &return_type))
         } else {
-            Ok(JavaValue::from_raw(result.result, &return_type, &core))
+            Ok(codec.decode_word(result.result, &return_type))
         }
     }
 
@@ -218,13 +217,32 @@ impl JavaMethod {
         Ok(result)
     }
 
+    pub(super) fn exception_class_matches(core: &ArmCore, jvm: &Jvm, exception: &dyn ClassInstance, ptr_class: u32) -> Result<bool> {
+        if ptr_class == 0 {
+            return Ok(true);
+        }
+
+        if let Some(instance) = exception.as_any().downcast_ref::<JavaClassInstance>() {
+            for class in instance.class()?.read_class_hierarchy()? {
+                if class.ptr_raw == ptr_class || class.ptr_vtable()? == ptr_class {
+                    return Ok(true);
+                }
+            }
+
+            return Ok(false);
+        }
+
+        let class = JavaClassDefinition::from_raw(ptr_class, core);
+        Ok(jvm.is_instance(exception, &class.name()?))
+    }
+
     pub async fn handle_exception(core: &mut ArmCore, jvm: &Jvm, exception: Box<dyn ClassInstance>) -> Result<JavaMethodResult> {
         tracing::warn!("Java exception thrown: {exception:?}");
 
         let current_java_exception_handler = KtfJvmSupport::current_java_exception_handler(core)?;
 
         if current_java_exception_handler == 0 {
-            return Err(JvmSupport::to_wie_err(jvm, JavaError::JavaException(exception)).await);
+            return Err(WieError::JavaException(KtfJvmSupport::class_instance_raw(&exception)));
         }
 
         let exception_handler: RawJavaExceptionHandler = read_generic(core, current_java_exception_handler)?;
@@ -233,28 +251,28 @@ impl JavaMethod {
         let exception_table = method.exception_table()?;
 
         for entry in exception_table {
-            if entry.from_pc <= exception_handler.current_pc && exception_handler.current_pc < entry.to_pc {
-                let class = JavaClassDefinition::from_raw(entry.ptr_class, core);
-                if entry.ptr_class == 0 || jvm.is_instance(&*exception, &class.name()?) {
-                    let restore_context: u32 = read_generic(core, exception_handler.ptr_functions + 4)?;
-                    let contexts_base = current_java_exception_handler + 24;
+            if entry.from_pc <= exception_handler.current_pc
+                && exception_handler.current_pc < entry.to_pc
+                && Self::exception_class_matches(core, jvm, &*exception, entry.ptr_class)?
+            {
+                let restore_context: u32 = read_generic(core, exception_handler.ptr_functions + 4)?;
+                let contexts_base = current_java_exception_handler + 24;
 
-                    tracing::debug!(
-                        "Java exception handler found: {:#x}, method: {:#x}",
-                        entry.target,
-                        exception_handler.ptr_method
-                    );
+                tracing::debug!(
+                    "Java exception handler found: {:#x}, method: {:#x}",
+                    entry.target,
+                    exception_handler.ptr_method
+                );
 
-                    return Err(WieError::JavaExceptionUnwind {
-                        context_base: contexts_base,
-                        target: entry.target,
-                        next_pc: restore_context,
-                    });
-                }
+                return Err(WieError::JavaExceptionUnwind {
+                    context_base: contexts_base,
+                    target: entry.target,
+                    next_pc: restore_context,
+                });
             }
         }
 
-        Err(JvmSupport::to_wie_err(jvm, JavaError::JavaException(exception)).await)
+        Err(WieError::JavaException(KtfJvmSupport::class_instance_raw(&exception)))
     }
 
     fn register_java_method<C, Context>(
@@ -358,13 +376,7 @@ where
     Context: Deref<Target = C> + DerefMut + Clone + 'static + Sync + Send,
 {
     async fn call(&self, core: &mut ArmCore, _: &mut ()) -> Result<JavaMethodResult> {
-        let double_long_count = self
-            .parameter_types
-            .iter()
-            .filter(|x| matches!(x, JavaType::Double | JavaType::Long))
-            .count();
-
-        let param_count = self.parameter_types.len() + double_long_count;
+        let param_count = method_argument_word_count(&self.parameter_types);
 
         let raw_args = if self.proto.access_flags.contains(MethodAccessFlags::NATIVE) {
             let param_base = u32::get(core, 1);
@@ -375,21 +387,8 @@ where
             (0..param_count).map(|x| u32::get(core, x + 1)).collect::<Vec<_>>()
         };
 
-        let mut args = Vec::with_capacity(self.parameter_types.len());
-
-        let mut it = raw_args.into_iter();
-        for param in self.parameter_types.iter() {
-            let arg = it.next().unwrap();
-
-            let value = if matches!(param, JavaType::Double | JavaType::Long) {
-                let arg_high = it.next().unwrap();
-
-                JavaValue::from_raw64(arg, arg_high, param)
-            } else {
-                JavaValue::from_raw(arg, param, core)
-            };
-            args.push(value);
-        }
+        let codec = JavaValueCodec::new(core);
+        let args = decode_method_arguments(&codec, &self.parameter_types, &raw_args);
 
         let mut context = self.context.clone();
         let (_, lr) = core.read_pc_lr()?;
@@ -405,10 +404,10 @@ where
         }
 
         let result = if matches!(self.return_type, JavaType::Double | JavaType::Long) {
-            let (result, result_high) = result.unwrap().as_raw64();
+            let (result, result_high) = codec.encode_wide(&result.unwrap());
             vec![result, result_high]
         } else {
-            vec![result.unwrap().as_raw()]
+            vec![codec.encode_word(&result.unwrap())]
         };
 
         Ok(JavaMethodResult { result, next_pc: None })

@@ -46,8 +46,6 @@ impl Audio {
     }
 
     pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
-        SmafPlayer::new(data)?;
-
         let audio_handle = self.last_audio_handle;
 
         self.last_audio_handle += 1;

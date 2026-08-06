@@ -71,7 +71,7 @@ impl WIPICContext for LgtWIPICContext {
 
         impl AsyncCallable<Result<()>> for SpawnProxy {
             async fn call(mut self) -> Result<()> {
-                self.context.jvm.attach_thread().unwrap();
+                self.context.jvm.attach_thread(None).await.unwrap();
                 self.callback.call(&mut self.context, Box::new([])).await?;
                 self.context.jvm.detach_thread().unwrap();
 
@@ -88,19 +88,20 @@ impl WIPICContext for LgtWIPICContext {
     }
 
     async fn get_resource_size(&self, name: &str) -> Result<Option<usize>> {
-        let class_loader = self.jvm.current_class_loader().await.unwrap();
+        let class_loader = JavaLangClassLoader::get_system_class_loader(&self.jvm).await.unwrap();
         let stream = JavaLangClassLoader::get_resource_as_stream(&self.jvm, &class_loader, name).await.unwrap();
 
         if let Some(stream) = stream {
             let available: i32 = self.jvm.invoke_virtual(&stream, "available", "()I", ()).await.unwrap();
             return Ok(Some(available as _));
         }
+        self.jvm.collect_garbage().unwrap();
 
         Ok(self.system.filesystem().size(name).await)
     }
 
     async fn read_resource(&self, name: &str) -> Result<Vec<u8>> {
-        let class_loader = self.jvm.current_class_loader().await.unwrap();
+        let class_loader = JavaLangClassLoader::get_system_class_loader(&self.jvm).await.unwrap();
         let stream = JavaLangClassLoader::get_resource_as_stream(&self.jvm, &class_loader, name).await.unwrap();
 
         if let Some(stream) = stream {
@@ -113,6 +114,8 @@ impl WIPICContext for LgtWIPICContext {
         let mut data = vec![0; size];
         let read = self.system.filesystem().read(name, 0, size, &mut data).await.unwrap_or(0);
         data.truncate(read);
+
+        self.jvm.collect_garbage().unwrap();
 
         Ok(data)
     }

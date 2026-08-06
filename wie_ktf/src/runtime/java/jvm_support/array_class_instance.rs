@@ -4,12 +4,13 @@ use core::{
     hash::{Hash, Hasher},
 };
 
-use jvm::{ArrayClassInstance, ArrayRawBuffer, ArrayRawBufferMut, ClassDefinition, ClassInstance, JavaType, JavaValue, Result as JvmResult};
+use jvm::{ArrayClassInstance, ArrayRawBuffer, ArrayRawBufferMut, ClassDefinition, ClassInstance, Field, JavaType, JavaValue, Result as JvmResult};
 
 use wie_core_arm::ArmCore;
+use wie_jvm_support::native::{decode_array_values, encode_array_values};
 use wie_util::{ByteRead, ByteWrite, read_generic, write_generic};
 
-use super::{Result, array_class_definition::JavaArrayClassDefinition, class_instance::JavaClassInstance, value::JavaValueExt};
+use super::{Result, array_class_definition::JavaArrayClassDefinition, class_instance::JavaClassInstance, value::JavaValueCodec};
 
 #[derive(Clone)]
 pub struct JavaArrayClassInstance {
@@ -74,11 +75,29 @@ impl JavaArrayClassInstance {
 }
 
 #[async_trait::async_trait]
-impl ArrayClassInstance for JavaArrayClassInstance {
+impl ClassInstance for JavaArrayClassInstance {
     fn destroy(self: Box<Self>) {
         let field_size = self.element_size().unwrap() * self.array_length().unwrap() + 4;
 
         self.class_instance.destroy(field_size as _).unwrap()
+    }
+
+    fn identity(&self) -> usize {
+        self.class_instance.ptr_raw as _
+    }
+
+    fn shallow_clone(&self) -> JvmResult<Box<dyn ClassInstance>> {
+        let mut core = self.core.clone();
+        let array_class = JavaArrayClassDefinition::from_raw(self.class_instance.class().unwrap().ptr_raw, &self.core);
+        let length = self.array_length().unwrap();
+
+        let mut instance = Self::new(&mut core, &array_class, length).unwrap();
+
+        let mut buf = vec![0; length * self.element_size().unwrap()];
+        self.load_raw(0, &mut buf).unwrap();
+        instance.store_raw(0, buf).unwrap();
+
+        Ok(Box::new(instance))
     }
 
     fn class_definition(&self) -> Box<dyn ClassDefinition> {
@@ -94,21 +113,28 @@ impl ArrayClassInstance for JavaArrayClassInstance {
         Ok(self.class_instance.ptr_raw == other.unwrap().class_instance.ptr_raw)
     }
 
+    fn as_array_instance(&self) -> Option<&dyn ArrayClassInstance> {
+        Some(self)
+    }
+
+    fn as_array_instance_mut(&mut self) -> Option<&mut dyn ArrayClassInstance> {
+        Some(self)
+    }
+
+    fn get_field(&self, _field: &dyn Field) -> JvmResult<JavaValue> {
+        panic!("Array classes do not have fields")
+    }
+
+    fn put_field(&mut self, _field: &dyn Field, _value: JavaValue) -> JvmResult<()> {
+        panic!("Array classes do not have fields")
+    }
+}
+
+impl ArrayClassInstance for JavaArrayClassInstance {
     fn store(&mut self, offset: usize, values: Box<[JavaValue]>) -> JvmResult<()> {
         let element_size = self.element_size().unwrap();
-
-        let values = values.to_vec();
-
-        let raw_values = match element_size {
-            1 => values.into_iter().map(|x| x.as_raw() as u8).collect::<Vec<_>>(),
-            2 => values
-                .into_iter()
-                .map(|x| x.as_raw() as u16)
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>(),
-            4 => values.into_iter().map(|x| x.as_raw()).flat_map(u32::to_le_bytes).collect::<Vec<_>>(),
-            _ => unreachable!(),
-        };
+        let element_type = self.element_type().unwrap();
+        let raw_values = encode_array_values(&JavaValueCodec::new(&self.core), &element_type, &values);
 
         let offset = offset * element_size;
         self.store_raw(offset as _, raw_values).unwrap();
@@ -125,21 +151,7 @@ impl ArrayClassInstance for JavaArrayClassInstance {
 
         let element_type = self.element_type().unwrap();
 
-        Ok(match element_size {
-            1 => values_raw
-                .into_iter()
-                .map(|x| JavaValue::from_raw(x as _, &element_type, &self.core))
-                .collect::<Vec<_>>(),
-            2 => values_raw
-                .chunks(2)
-                .map(|x| JavaValue::from_raw(u16::from_le_bytes(x.try_into().unwrap()) as _, &element_type, &self.core))
-                .collect::<Vec<_>>(),
-            4 => values_raw
-                .chunks(4)
-                .map(|x| JavaValue::from_raw(u32::from_le_bytes(x.try_into().unwrap()) as _, &element_type, &self.core))
-                .collect::<Vec<_>>(),
-            _ => unreachable!(),
-        })
+        Ok(decode_array_values(&JavaValueCodec::new(&self.core), &element_type, &values_raw))
     }
 
     fn raw_buffer(&self) -> JvmResult<Box<dyn ArrayRawBuffer>> {

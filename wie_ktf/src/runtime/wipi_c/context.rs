@@ -8,7 +8,8 @@ use wipi_types::wipic::{WIPICIndirectPtr, WIPICWord};
 
 use wie_backend::{AsyncCallable, Event, Instant, System};
 use wie_core_arm::{Allocator, ArmCore};
-use wie_util::{ByteRead, ByteWrite, Result, read_generic, write_generic};
+use wie_jvm_support::JvmSupport;
+use wie_util::{ByteRead, ByteWrite, Result, WieError, read_generic, write_generic};
 use wie_wipi_c::{WIPICContext, WIPICMethodBody};
 
 #[derive(Clone)]
@@ -73,7 +74,7 @@ impl WIPICContext for KtfWIPICContext {
 
         impl AsyncCallable<Result<()>> for SpawnProxy {
             async fn call(mut self) -> Result<()> {
-                self.context.jvm.attach_thread().unwrap();
+                self.context.jvm.attach_thread(None).await.unwrap();
                 self.callback.call(&mut self.context, Box::new([])).await?;
                 self.context.jvm.detach_thread().unwrap();
 
@@ -90,26 +91,62 @@ impl WIPICContext for KtfWIPICContext {
     }
 
     async fn get_resource_size(&self, name: &str) -> Result<Option<usize>> {
-        let class_loader = self.jvm.current_class_loader().await.unwrap();
-        let stream = JavaLangClassLoader::get_resource_as_stream(&self.jvm, &class_loader, name).await.unwrap();
+        let class_loader = JavaLangClassLoader::get_system_class_loader(&self.jvm)
+            .await
+            .map_err(|err| WieError::FatalError(alloc::format!("Failed to get class loader for resource {name:?}: {err:?}")))?;
+        let stream = match JavaLangClassLoader::get_resource_as_stream(&self.jvm, &class_loader, name).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::error!("Java exception while opening resource for size query: name={name:?}, error={err:?}");
+                return Err(JvmSupport::to_wie_err(&self.jvm, err).await);
+            }
+        };
 
-        if stream.is_none() {
-            return Ok(None);
+        let result = match stream {
+            Some(stream) => {
+                let available: i32 = match self.jvm.invoke_virtual(&stream, "available", "()I", ()).await {
+                    Ok(available) => available,
+                    Err(err) => return Err(JvmSupport::to_wie_err(&self.jvm, err).await),
+                };
+                drop(stream);
+                Some(available as usize)
+            }
+            None => None,
+        };
+        match self.jvm.collect_garbage() {
+            Ok(_) => {}
+            Err(err) => return Err(JvmSupport::to_wie_err(&self.jvm, err).await),
         }
 
-        let available: i32 = self.jvm.invoke_virtual(&stream.unwrap(), "available", "()I", ()).await.unwrap();
-
-        Ok(Some(available as _))
+        Ok(result)
     }
 
     async fn read_resource(&self, name: &str) -> Result<Vec<u8>> {
-        let class_loader = self.jvm.current_class_loader().await.unwrap();
-        let stream = JavaLangClassLoader::get_resource_as_stream(&self.jvm, &class_loader, name)
+        let class_loader = JavaLangClassLoader::get_system_class_loader(&self.jvm)
             .await
-            .unwrap()
-            .unwrap();
+            .map_err(|err| WieError::FatalError(alloc::format!("Failed to get class loader for resource {name:?}: {err:?}")))?;
+        let stream = match JavaLangClassLoader::get_resource_as_stream(&self.jvm, &class_loader, name).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return Err(WieError::FatalError(alloc::format!("Resource disappeared before read: {name:?}"))),
+            Err(err) => {
+                tracing::error!("Java exception while opening resource for read: name={name:?}, error={err:?}");
+                return Err(JvmSupport::to_wie_err(&self.jvm, err).await);
+            }
+        };
 
-        Ok(JavaIoInputStream::read_until_end(&self.jvm, &stream).await.unwrap())
+        let data = match JavaIoInputStream::read_until_end(&self.jvm, &stream).await {
+            Ok(data) => data,
+            Err(err) => {
+                tracing::error!("Java exception while reading resource: name={name:?}, error={err:?}");
+                return Err(JvmSupport::to_wie_err(&self.jvm, err).await);
+            }
+        };
+        drop(stream);
+        match self.jvm.collect_garbage() {
+            Ok(_) => {}
+            Err(err) => return Err(JvmSupport::to_wie_err(&self.jvm, err).await),
+        }
+        Ok(data)
     }
 
     fn set_timer(&mut self, due: Instant, callback: WIPICMethodBody) {

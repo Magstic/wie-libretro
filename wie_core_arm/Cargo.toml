@@ -11,9 +11,9 @@ hooks = ["dep:md5", "dep:serde", "dep:toml"]
 async-trait = { workspace = true }
 bytemuck = { workspace = true }
 md5 = { workspace = true, optional = true }
-serde = { version = "^1", default-features = false, features = ["derive", "alloc"], optional = true }
+serde = { workspace = true, optional = true }
 spin = { workspace = true }
-toml = { version = "^1", default-features = false, features = ["parse", "serde"], optional = true }
+toml = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 arm32_cpu = { git = "https://github.com/dlunch/arm32_cpu.git" }

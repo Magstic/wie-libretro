@@ -23,14 +23,14 @@ jobs:
           submodules: "recursive"
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo
 
       - name: Cache cargo build
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.rust }}-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -44,7 +44,7 @@ jobs:
 
       - name: Install required packages
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt update;sudo apt install libasound2-dev libudev-dev
+        run: sudo apt update;sudo apt install -y --no-install-recommends libwebkit2gtk-4.1-dev libasound2-dev libudev-dev
 
       - name: Install required packages
         if: matrix.os == 'windows-latest'
@@ -52,15 +52,20 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all -- -D warnings
-      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown --workspace --exclude wie_app -- -D warnings
       - run: cargo build -p wie_libretro --release
+      - run: cargo test --all
 
-      - if: matrix.os == 'windows-latest'
-        run: |
-          $env:RUST_MIN_STACK=4194304
-          cargo test --all
+      - name: Save cache cargo
+        uses: actions/cache/save@v6
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - if: matrix.os != 'windows-latest'
-        run: |
-          export RUST_MIN_STACK=4194304
-          cargo test --all
+      - name: Save cache cargo build
+        uses: actions/cache/save@v6
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.rust }}-build-target-${{ hashFiles('**/Cargo.lock') }}

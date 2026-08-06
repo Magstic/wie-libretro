@@ -120,6 +120,12 @@ pub struct LibretroScreen {
 }
 
 impl Screen for LibretroScreen {
+    fn resize(&self, _width: u32, _height: u32) -> Result<()> {
+        // Libretro geometry is selected by the frontend before the game starts.
+        // Keep that negotiated size instead of changing it from guest metadata.
+        Ok(())
+    }
+
     fn request_redraw(&self) -> Result<()> {
         self.shared.redraw_requested.store(true, Ordering::Release);
         Ok(())

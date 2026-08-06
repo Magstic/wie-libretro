@@ -33,7 +33,9 @@ impl Arm32CpuEngine {
         self.mem.read_range(svc_address, 2, &mut svc_bytes)?;
         let instruction = u16::from_le_bytes(svc_bytes);
         if instruction & 0xff00 != 0xdf00 {
-            return Err(WieError::FatalError(format!("Invalid Thumb SVC instruction {instruction:#06x}")));
+            return Err(WieError::FatalError(format!(
+                "Invalid Thumb SVC instruction {instruction:#06x} at {svc_address:#x}"
+            )));
         }
 
         let category = instruction as u32 & 0xff;
@@ -349,9 +351,20 @@ impl Memory for Arm32CpuMemory<'_> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+    use core::mem::size_of;
+
     use arm32_cpu::Memory;
 
     use super::EmulatedMemory;
+
+    #[test]
+    fn page_table_is_heap_allocated() {
+        assert_eq!(
+            size_of::<EmulatedMemory>(),
+            size_of::<Box<[bool]>>() + size_of::<Box<[Option<Box<[u8; super::PAGE_SIZE]>>]>>()
+        );
+    }
 
     #[test]
     fn test_memory_basic() {

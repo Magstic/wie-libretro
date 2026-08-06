@@ -21,7 +21,6 @@ pub trait JvmImplementation: Clone {
     where
         C: ?Sized + 'static + Send,
         Context: Sync + Send + DerefMut + Deref<Target = C> + Clone + 'static;
-    fn define_class_java(&self, jvm: &Jvm, data: &[u8]) -> impl Future<Output = JvmResult<Box<dyn ClassDefinition>>> + Send;
     fn define_array_class(&self, jvm: &Jvm, element_type_name: &str) -> impl Future<Output = JvmResult<Box<dyn ClassDefinition>>> + Send;
 }
 
@@ -40,10 +39,6 @@ impl JvmImplementation for RustJavaJvmImplementation {
         Context: Sync + Send + DerefMut + Deref<Target = C> + Clone + 'static,
     {
         Box::pin(future::ready(Ok(Box::new(ClassDefinitionImpl::from_class_proto(proto, context)) as _)))
-    }
-
-    async fn define_class_java(&self, _jvm: &Jvm, data: &[u8]) -> JvmResult<Box<dyn ClassDefinition>> {
-        ClassDefinitionImpl::from_classfile(data).map(|x| Box::new(x) as Box<_>)
     }
 
     async fn define_array_class(&self, _jvm: &Jvm, element_type_name: &str) -> JvmResult<Box<dyn ClassDefinition>> {

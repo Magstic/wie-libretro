@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "wie_app",
     "wie_backend",
     "wie_cli",
     "wie_util",
@@ -15,6 +16,7 @@ members = [
     "wie_lgt",
     "wie_libretro",
     "wie_skt",
+    "wie_web",
 ]
 
 default-members = ["wie_cli"]
@@ -42,8 +44,11 @@ bytemuck = { version = "^1.25", default-features = false, features = ["derive"] 
 clap = { version = "^4.6", features = ["derive"] }
 dyn-clone = { version = "^1.0", default-features = false }
 futures = { version = "^0.3", default-features = false, features = ["alloc"] }
+lazy_static = { version = "^1.5", default-features = false }
 md5 = { version = "^0.8", default-features = false }
+serde = { version = "^1", default-features = false, features = ["derive", "alloc"] }
 spin = { version = "^0.12", features = ["spin_mutex", "rwlock"], default-features = false }
+toml = { version = "^1", default-features = false, features = ["parse", "serde"] }
 tracing = { version = "^0.1", default-features = false, features = ["attributes"] }
 
 java_class_proto = { git = "https://github.com/dlunch/RustJava.git" }

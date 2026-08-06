@@ -6,11 +6,15 @@ pub mod classes;
 
 use wie_jvm_support::WieJavaClassProto;
 
-pub fn get_protos() -> [WieJavaClassProto; 35] {
+pub fn get_protos() -> [WieJavaClassProto; 42] {
     [
         crate::classes::org::kwis::msf::io::Network::as_proto(),
         crate::classes::org::kwis::msf::io::SchemeNotFoundException::as_proto(),
+        crate::classes::org::kwis::msf::io::Socket::as_proto(),
+        crate::classes::org::kwis::msf::io::URL::as_proto(),
         crate::classes::org::kwis::msp::db::DataBase::as_proto(),
+        crate::classes::org::kwis::msp::db::DataComparator::as_proto(),
+        crate::classes::org::kwis::msp::db::DataFilter::as_proto(),
         crate::classes::org::kwis::msp::db::DataBaseException::as_proto(),
         crate::classes::org::kwis::msp::db::DataBaseRecordException::as_proto(),
         crate::classes::org::kwis::msp::handset::BackLight::as_proto(),
@@ -23,10 +27,12 @@ pub fn get_protos() -> [WieJavaClassProto; 35] {
         crate::classes::org::kwis::msp::lcdui::Font::as_proto(),
         crate::classes::org::kwis::msp::lcdui::Graphics::as_proto(),
         crate::classes::org::kwis::msp::lcdui::Image::as_proto(),
+        crate::classes::org::kwis::msp::lcdui::ImageObserver::as_proto(),
         crate::classes::org::kwis::msp::lcdui::InputMethodHandler::as_proto(),
         crate::classes::org::kwis::msp::lcdui::Main::as_proto(),
         crate::classes::org::kwis::msp::lcdui::Jlet::as_proto(),
         crate::classes::org::kwis::msp::lcdui::JletEventListener::as_proto(),
+        crate::classes::org::kwis::msp::lcdui::JletWrapper::as_proto(),
         crate::classes::org::kwis::msp::lwc::Component::as_proto(),
         crate::classes::org::kwis::msp::lwc::ContainerComponent::as_proto(),
         crate::classes::org::kwis::msp::lwc::EventListener::as_proto(),
@@ -42,6 +48,7 @@ pub fn get_protos() -> [WieJavaClassProto; 35] {
         crate::classes::org::kwis::msp::media::Vibrator::as_proto(),
         crate::classes::org::kwis::msp::media::Volume::as_proto(),
         crate::classes::net::wie::CardCanvas::as_proto(),
+        crate::classes::net::wie::WIPIFileOutputStream::as_proto(),
         crate::classes::net::wie::WIPIMIDlet::as_proto(),
     ]
 }

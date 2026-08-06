@@ -19,8 +19,9 @@ pub type ThreadId = usize;
 
 pub use self::{
     allocator::Allocator,
+    context::ArmCoreContext,
     core::{ArmCore, RUN_FUNCTION_LR, RunFunctionResult},
-    function::{EmulatedFunction, EmulatedFunctionParam, RegisteredFunction, RegisteredFunctionHolder, ResultWriter, SvcId},
+    function::{EmulatedFunction, EmulatedFunctionParam, JumpTo, RegisteredFunction, RegisteredFunctionHolder, ResultWriter, SvcId},
 };
 
 static HOOKS_ENABLED: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(true);

@@ -59,18 +59,20 @@ pub trait ImageBuffer: Send {
 #[allow(clippy::too_many_arguments)]
 pub trait Canvas: Send {
     fn image(&self) -> &dyn Image;
+    fn get_pixel(&self, x: i32, y: i32) -> Option<Color>;
     fn set_xor_mode(&mut self, xor_mode: bool);
     fn copy_area(&mut self, dx: i32, dy: i32, sx: i32, sy: i32, w: u32, h: u32, clip: Clip);
     fn draw(&mut self, dx: i32, dy: i32, w: u32, h: u32, src: &dyn Image, sx: i32, sy: i32, clip: Clip);
-    fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color);
-    fn draw_text(&mut self, string: &str, x: i32, y: i32, text_alignment: TextAlignment, color: Color);
+    fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color, clip: Clip);
+    fn draw_text(&mut self, string: &str, x: i32, y: i32, text_alignment: TextAlignment, color: Color, clip: Clip);
     fn draw_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Color, clip: Clip);
     fn draw_arc(&mut self, x: i32, y: i32, w: u32, h: u32, start_angle: i32, arc_angle: i32, color: Color, clip: Clip);
     fn draw_round_rect(&mut self, x: i32, y: i32, w: u32, h: u32, arc_width: u32, arc_height: u32, color: Color, clip: Clip);
     fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Color, clip: Clip);
     fn fill_arc(&mut self, x: i32, y: i32, w: u32, h: u32, start_angle: i32, arc_angle: i32, color: Color, clip: Clip);
     fn fill_round_rect(&mut self, x: i32, y: i32, w: u32, h: u32, arc_width: u32, arc_height: u32, color: Color, clip: Clip);
-    fn put_pixel(&mut self, x: i32, y: i32, color: Color);
+    fn invert_rect(&mut self, x: i32, y: i32, w: u32, h: u32, clip: Clip);
+    fn put_pixel(&mut self, x: i32, y: i32, color: Color, clip: Clip);
 }
 
 pub trait PixelType: Send {
@@ -370,7 +372,7 @@ where
         if x < 0 || y < 0 || (x as u32) >= self.image_buffer.width() || (y as u32) >= self.image_buffer.height() {
             return;
         }
-        if color.a == 0 {
+        if blend && color.a == 0 {
             return;
         }
 
@@ -412,10 +414,12 @@ where
         if x < 0 || y < 0 || (x as u32) >= self.image_buffer.width() || (y as u32) >= self.image_buffer.height() {
             return;
         }
-        if x < clip.x || x >= clip.x + clip.width as i32 || y < clip.y || y >= clip.y + clip.height as i32 {
+        let x = x as i64;
+        let y = y as i64;
+        if x < clip.x as i64 || x >= clip.x as i64 + clip.width as i64 || y < clip.y as i64 || y >= clip.y as i64 + clip.height as i64 {
             return;
         }
-        self.put_pixel(x, y, color);
+        self.compose_pixel(x as i32, y as i32, color, false);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -423,7 +427,10 @@ where
         let radius = a.max(b).max(1.0);
         let sweep_rad = sweep_deg.to_radians();
         let start_rad = start_deg.to_radians();
-        let steps = ((sweep_rad.abs() * radius).ceil() as i32 * 2).max(1);
+        // the visible portion of any arc is bounded by the image perimeter, so cap
+        // the step count; otherwise a guest-supplied huge radius spins for minutes
+        let max_steps = 16 * (self.image_buffer.width() as i64 + self.image_buffer.height() as i64).max(1);
+        let steps = ((sweep_rad.abs() * radius).ceil() as i64 * 2).clamp(1, max_steps) as i32;
 
         for i in 0..=steps {
             let theta = start_rad + sweep_rad * (i as f32) / (steps as f32);
@@ -432,6 +439,58 @@ where
             self.plot(px, py, color, clip);
         }
     }
+}
+
+/// Liang-Barsky clip of a segment to the image bounds (expanded by one pixel so
+/// endpoints just outside still step in correctly). Endpoints already inside are
+/// returned unchanged to keep the exact bresenham pixel pattern.
+fn clip_segment(x1: i32, y1: i32, x2: i32, y2: i32, width: u32, height: u32) -> Option<(i32, i32, i32, i32)> {
+    let (min_x, min_y) = (-1.0, -1.0);
+    let (max_x, max_y) = (width as f64, height as f64);
+
+    let inside = |x: i32, y: i32| (min_x..=max_x).contains(&(x as f64)) && (min_y..=max_y).contains(&(y as f64));
+    if inside(x1, y1) && inside(x2, y2) {
+        return Some((x1, y1, x2, y2));
+    }
+
+    let (fx1, fy1) = (x1 as f64, y1 as f64);
+    let (dx, dy) = (x2 as f64 - fx1, y2 as f64 - fy1);
+
+    let mut t0 = 0.0f64;
+    let mut t1 = 1.0f64;
+    for (p, q) in [(-dx, fx1 - min_x), (dx, max_x - fx1), (-dy, fy1 - min_y), (dy, max_y - fy1)] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+
+    Some((
+        (fx1 + dx * t0).round() as i32,
+        (fy1 + dy * t0).round() as i32,
+        (fx1 + dx * t1).round() as i32,
+        (fy1 + dy * t1).round() as i32,
+    ))
+}
+
+/// Intersect the span [start, start + len) with [0, max) in i64 so extreme
+/// guest-supplied coordinates can neither overflow i32 nor iterate off-image.
+fn clamp_span(start: i32, len: u32, max: u32) -> core::ops::Range<i32> {
+    let s = (start as i64).max(0);
+    let e = (start as i64 + len as i64).min(max as i64);
+
+    if s >= e { 0..0 } else { s as i32..e as i32 }
 }
 
 /// Whether the point lies within the pie sweep starting at `start_deg` spanning
@@ -469,6 +528,14 @@ where
 {
     fn image(&self) -> &dyn Image {
         &self.image_buffer
+    }
+
+    fn get_pixel(&self, x: i32, y: i32) -> Option<Color> {
+        if x < 0 || y < 0 || (x as u32) >= self.image_buffer.width() || (y as u32) >= self.image_buffer.height() {
+            return None;
+        }
+
+        Some(self.image_buffer.get_pixel(x, y))
     }
 
     fn set_xor_mode(&mut self, xor_mode: bool) {
@@ -525,15 +592,22 @@ where
         }
 
         let row_width = (x_end - x_start) as usize;
-        let mut source_row = vec![Color { a: 0, r: 0, g: 0, b: 0 }; row_width];
+        let row_count = (y_end - y_start) as usize;
+        let mut source_pixels = Vec::with_capacity(row_width * row_count);
         for row in y_start..y_end {
             let source_y = sy + row as i32;
+            let mut source_row = vec![Color { a: 0, r: 0, g: 0, b: 0 }; row_width];
+            src.get_pixels(sx + x_start as i32, source_y, &mut source_row);
+            source_pixels.extend(source_row);
+        }
+
+        for (row_index, row) in (y_start..y_end).enumerate() {
             let destination_y = dy + row as i32;
             let destination_x = dx + x_start as i32;
-            src.get_pixels(sx + x_start as i32, source_y, &mut source_row);
+            let source_row = &source_pixels[row_index * row_width..(row_index + 1) * row_width];
 
             if !self.xor_mode && source_row.iter().all(|color| color.a == 0xff) {
-                self.image_buffer.put_pixels(destination_x, destination_y, row_width as u32, &source_row);
+                self.image_buffer.put_pixels(destination_x, destination_y, row_width as u32, source_row);
             } else {
                 for (column, color) in source_row.iter().enumerate() {
                     self.blend_pixel(destination_x + column as i32, destination_y, *color);
@@ -542,11 +616,12 @@ where
         }
     }
 
-    fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color) {
-        if x1 == x2 && y1 == y2 {
-            self.blend_pixel(x1 as _, y1 as _, color);
+    fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color, clip: Clip) {
+        // pre-clip to image bounds: guest can pass extreme coordinates whose deltas
+        // overflow i32 and whose bresenham walk would take billions of steps
+        let Some((x1, y1, x2, y2)) = clip_segment(x1, y1, x2, y2, self.image_buffer.width(), self.image_buffer.height()) else {
             return;
-        }
+        };
 
         // bresenham's line drawing
         let dx = (x2 - x1).abs();
@@ -559,7 +634,7 @@ where
         let mut y = y1;
 
         loop {
-            self.blend_pixel(x as _, y as _, color);
+            self.plot(x, y, color, &clip);
             if x == x2 && y == y2 {
                 break;
             }
@@ -576,7 +651,7 @@ where
         }
     }
 
-    fn draw_text(&mut self, string: &str, x: i32, y: i32, text_alignment: TextAlignment, color: Color) {
+    fn draw_text(&mut self, string: &str, x: i32, y: i32, text_alignment: TextAlignment, color: Color, clip: Clip) {
         let size = 10.0; // TODO
         let font = FONT.as_scaled(FONT.pt_to_px_scale(size).unwrap());
 
@@ -599,9 +674,14 @@ where
             if let Some(outlined_glyph) = font.outline_glyph(glyph) {
                 outlined_glyph.draw(|glyph_x: u32, glyph_y, c| {
                     let bounds = outlined_glyph.px_bounds();
+                    let px = x + (glyph_x as f32 + bounds.min.x + position) as i32;
+                    let py = y + (glyph_y as f32 + bounds.min.y + size) as i32;
+                    if px < clip.x || px >= clip.x + clip.width as i32 || py < clip.y || py >= clip.y + clip.height as i32 {
+                        return;
+                    }
                     self.blend_pixel(
-                        x + (glyph_x as f32 + bounds.min.x + position) as i32,
-                        y + (glyph_y as f32 + bounds.min.y + size) as i32,
+                        px,
+                        py,
                         Color {
                             a: (c * 255.0) as u8,
                             r: color.r,
@@ -656,21 +736,36 @@ where
 
         let rx = (arc_width.min(w) as f32 / 2.0).max(0.5);
         let ry = (arc_height.min(h) as f32 / 2.0).max(0.5);
-        let rxi = rx.round() as i32;
-        let ryi = ry.round() as i32;
+        let rxi = rx.round() as i64;
+        let ryi = ry.round() as i64;
 
-        let left = x;
-        let right = x + w as i32 - 1;
-        let top = y;
-        let bottom = y + h as i32 - 1;
+        let width = self.image_buffer.width() as i64;
+        let height = self.image_buffer.height() as i64;
+        let left = x as i64;
+        let right = x as i64 + w as i64 - 1;
+        let top = y as i64;
+        let bottom = y as i64 + h as i64 - 1;
 
-        for px in (left + rxi)..=(right - rxi) {
-            self.plot(px, top, color, &clip);
-            self.plot(px, bottom, color, &clip);
+        let px_start = (left + rxi).max(0);
+        let px_end = (right - rxi + 1).min(width);
+        for px in px_start..px_end {
+            if (0..height).contains(&top) {
+                self.plot(px as i32, top as i32, color, &clip);
+            }
+            if (0..height).contains(&bottom) {
+                self.plot(px as i32, bottom as i32, color, &clip);
+            }
         }
-        for py in (top + ryi)..=(bottom - ryi) {
-            self.plot(left, py, color, &clip);
-            self.plot(right, py, color, &clip);
+
+        let py_start = (top + ryi).max(0);
+        let py_end = (bottom - ryi + 1).min(height);
+        for py in py_start..py_end {
+            if (0..width).contains(&left) {
+                self.plot(left as i32, py as i32, color, &clip);
+            }
+            if (0..width).contains(&right) {
+                self.plot(right as i32, py as i32, color, &clip);
+            }
         }
 
         self.stroke_arc(right as f32 - rx, top as f32 + ry, rx, ry, 0.0, 90.0, color, &clip);
@@ -699,7 +794,7 @@ where
         if self.xor_mode {
             for y in y_start..y_end {
                 for x in x_start..x_end {
-                    self.put_pixel(x as i32, y as i32, color);
+                    self.compose_pixel(x as i32, y as i32, color, false);
                 }
             }
             return;
@@ -725,8 +820,8 @@ where
         let start = start_angle as f32;
         let sweep = arc_angle as f32;
 
-        for py in y..y + h as i32 {
-            for px in x..x + w as i32 {
+        for py in clamp_span(y, h, self.image_buffer.height()) {
+            for px in clamp_span(x, w, self.image_buffer.width()) {
                 let nx = (px as f32 - cx) / da;
                 let ny = (py as f32 - cy) / db;
                 if nx * nx + ny * ny > 1.0 {
@@ -752,11 +847,11 @@ where
         let ry = (arc_height.min(h) as f32 / 2.0).max(0.5);
 
         let left_center = x as f32 + rx;
-        let right_center = (x + w as i32 - 1) as f32 - rx;
+        let right_center = (x as i64 + w as i64 - 1) as f32 - rx;
         let top_center = y as f32 + ry;
-        let bottom_center = (y + h as i32 - 1) as f32 - ry;
+        let bottom_center = (y as i64 + h as i64 - 1) as f32 - ry;
 
-        for py in y..y + h as i32 {
+        for py in clamp_span(y, h, self.image_buffer.height()) {
             let cy = if (py as f32) < top_center {
                 top_center
             } else if (py as f32) > bottom_center {
@@ -764,7 +859,7 @@ where
             } else {
                 py as f32
             };
-            for px in x..x + w as i32 {
+            for px in clamp_span(x, w, self.image_buffer.width()) {
                 let cx = if (px as f32) < left_center {
                     left_center
                 } else if (px as f32) > right_center {
@@ -782,8 +877,37 @@ where
         }
     }
 
-    fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
-        self.compose_pixel(x, y, color, false);
+    fn invert_rect(&mut self, x: i32, y: i32, w: u32, h: u32, clip: Clip) {
+        let image_width = self.image_buffer.width() as i64;
+        let image_height = self.image_buffer.height() as i64;
+        let x_start = (x as i64).max(clip.x as i64).max(0);
+        let y_start = (y as i64).max(clip.y as i64).max(0);
+        let x_end = (x as i64 + w as i64).min(clip.x as i64 + clip.width as i64).min(image_width);
+        let y_end = (y as i64 + h as i64).min(clip.y as i64 + clip.height as i64).min(image_height);
+
+        if x_start >= x_end || y_start >= y_end {
+            return;
+        }
+
+        for py in y_start..y_end {
+            for px in x_start..x_end {
+                let color = self.image_buffer.get_pixel(px as i32, py as i32);
+                self.image_buffer.put_pixel(
+                    px as i32,
+                    py as i32,
+                    Color {
+                        a: color.a,
+                        r: !color.r,
+                        g: !color.g,
+                        b: !color.b,
+                    },
+                );
+            }
+        }
+    }
+
+    fn put_pixel(&mut self, x: i32, y: i32, color: Color, clip: Clip) {
+        self.plot(x, y, color, &clip);
     }
 }
 
@@ -797,16 +921,16 @@ pub struct Clip {
 
 impl Clip {
     pub fn intersect(&self, other: &Clip) -> Clip {
-        let x = self.x.max(other.x) as i64;
-        let y = self.y.max(other.y) as i64;
-        let right = (self.x as i64 + self.width as i64).min(other.x as i64 + other.width as i64);
-        let bottom = (self.y as i64 + self.height as i64).min(other.y as i64 + other.height as i64);
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let width = (self.x as i64 + self.width as i64).min(other.x as i64 + other.width as i64) - x as i64;
+        let height = (self.y as i64 + self.height as i64).min(other.y as i64 + other.height as i64) - y as i64;
 
         Clip {
-            x: x as i32,
-            y: y as i32,
-            width: (right - x).max(0) as u32,
-            height: (bottom - y).max(0) as u32,
+            x,
+            y,
+            width: width.clamp(0, u32::MAX as i64) as _,
+            height: height.clamp(0, u32::MAX as i64) as _,
         }
     }
 }
@@ -844,13 +968,14 @@ pub fn string_width(string: &str, pt_size: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
+    use spin::Mutex;
 
     use wie_util::Result;
 
-    use crate::canvas::{Clip, Image, ImageBufferCanvas};
+    use crate::canvas::{Clip, Image, ImageBuffer, ImageBufferCanvas};
 
-    use super::{ArgbPixel, Canvas, Color, Rgb332Pixel, VecImageBuffer};
+    use super::{ArgbPixel, Canvas, Color, Rgb332Pixel, TextAlignment, VecImageBuffer};
 
     #[test]
     fn test_canvas() -> Result<()> {
@@ -947,7 +1072,7 @@ mod tests {
     #[test]
     fn draw_line_includes_both_endpoints() {
         let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(3, 1));
-        canvas.draw_line(0, 0, 2, 0, Color { a: 0xff, r: 1, g: 2, b: 3 });
+        canvas.draw_line(0, 0, 2, 0, Color { a: 0xff, r: 1, g: 2, b: 3 }, full_clip(3));
 
         assert_eq!(canvas.image().colors(), vec![Color { a: 0xff, r: 1, g: 2, b: 3 }; 3]);
     }
@@ -990,6 +1115,70 @@ mod tests {
     fn assert_color(image: &dyn Image, x: i32, y: i32, expected: Color) {
         let actual = image.get_pixel(x, y);
         assert_eq!((actual.a, actual.r, actual.g, actual.b), (expected.a, expected.r, expected.g, expected.b));
+    }
+
+    #[derive(Clone)]
+    struct SharedImageBuffer {
+        width: u32,
+        height: u32,
+        pixels: Arc<Mutex<Vec<Color>>>,
+    }
+
+    impl SharedImageBuffer {
+        fn new(width: u32, pixels: Vec<Color>) -> Self {
+            Self {
+                width,
+                height: pixels.len() as u32 / width,
+                pixels: Arc::new(Mutex::new(pixels)),
+            }
+        }
+    }
+
+    impl Image for SharedImageBuffer {
+        fn width(&self) -> u32 {
+            self.width
+        }
+
+        fn height(&self) -> u32 {
+            self.height
+        }
+
+        fn bytes_per_pixel(&self) -> u32 {
+            4
+        }
+
+        fn get_pixel(&self, x: i32, y: i32) -> Color {
+            self.pixels.lock()[(y as u32 * self.width + x as u32) as usize]
+        }
+
+        fn raw(&self) -> Cow<'_, [u8]> {
+            Cow::Owned(Vec::new())
+        }
+
+        fn colors(&self) -> Vec<Color> {
+            self.pixels.lock().clone()
+        }
+    }
+
+    impl ImageBuffer for SharedImageBuffer {
+        fn put_pixel(&mut self, x: i32, y: i32, color: Color) {
+            self.pixels.lock()[(y as u32 * self.width + x as u32) as usize] = color;
+        }
+
+        fn put_pixels(&mut self, x: i32, y: i32, width: u32, colors: &[Color]) {
+            for (index, color) in colors.iter().enumerate() {
+                self.put_pixel(x + index as i32 % width as i32, y + index as i32 / width as i32, *color);
+            }
+        }
+
+        fn xor_pixel(&mut self, x: i32, y: i32, color: Color) {
+            let mut pixels = self.pixels.lock();
+            let pixel = &mut pixels[(y as u32 * self.width + x as u32) as usize];
+            pixel.r ^= color.r;
+            pixel.g ^= color.g;
+            pixel.b ^= color.b;
+            pixel.a = 255;
+        }
     }
 
     #[test]
@@ -1052,10 +1241,10 @@ mod tests {
         let blue = Color { a: 255, r: 0, g: 0, b: 255 };
         let black = Color { a: 255, r: 0, g: 0, b: 0 };
 
-        canvas.put_pixel(0, 0, red);
-        canvas.put_pixel(1, 0, green);
-        canvas.put_pixel(2, 0, blue);
-        canvas.put_pixel(3, 0, black);
+        canvas.put_pixel(0, 0, red, full_clip(4));
+        canvas.put_pixel(1, 0, green, full_clip(4));
+        canvas.put_pixel(2, 0, blue, full_clip(4));
+        canvas.put_pixel(3, 0, black, full_clip(4));
 
         canvas.copy_area(1, 0, 0, 0, 3, 1, full_clip(4));
 
@@ -1079,10 +1268,10 @@ mod tests {
             height: 1,
         };
 
-        canvas.put_pixel(0, 0, red);
-        canvas.put_pixel(1, 0, green);
-        canvas.put_pixel(2, 0, blue);
-        canvas.put_pixel(3, 0, black);
+        canvas.put_pixel(0, 0, red, full_clip(4));
+        canvas.put_pixel(1, 0, green, full_clip(4));
+        canvas.put_pixel(2, 0, blue, full_clip(4));
+        canvas.put_pixel(3, 0, black, full_clip(4));
 
         canvas.copy_area(1, 0, 0, 0, 3, 1, clip);
 
@@ -1090,6 +1279,158 @@ mod tests {
         assert_color(canvas.image(), 1, 0, green);
         assert_color(canvas.image(), 2, 0, green);
         assert_color(canvas.image(), 3, 0, black);
+    }
+
+    #[test]
+    fn test_draw_preserves_sources_for_overlapping_copy_and_xor() {
+        let red = Color { a: 255, r: 255, g: 0, b: 0 };
+        let green = Color { a: 255, r: 0, g: 255, b: 0 };
+        let blue = Color { a: 255, r: 0, g: 0, b: 255 };
+        let black = Color { a: 255, r: 0, g: 0, b: 0 };
+
+        let shared = SharedImageBuffer::new(4, vec![red, green, blue, black]);
+        let source = shared.clone();
+        let mut canvas = ImageBufferCanvas::new(shared);
+        canvas.draw(1, 0, 3, 1, &source, 0, 0, full_clip(4));
+
+        assert_color(canvas.image(), 0, 0, red);
+        assert_color(canvas.image(), 1, 0, red);
+        assert_color(canvas.image(), 2, 0, green);
+        assert_color(canvas.image(), 3, 0, blue);
+
+        let shared = SharedImageBuffer::new(4, vec![red, green, blue, black]);
+        let source = shared.clone();
+        let mut canvas = ImageBufferCanvas::new(shared);
+        canvas.set_xor_mode(true);
+        canvas.draw(1, 0, 3, 1, &source, 0, 0, full_clip(4));
+
+        assert_color(canvas.image(), 0, 0, red);
+        assert_color(
+            canvas.image(),
+            1,
+            0,
+            Color {
+                a: 255,
+                r: 255,
+                g: 255,
+                b: 0,
+            },
+        );
+        assert_color(
+            canvas.image(),
+            2,
+            0,
+            Color {
+                a: 255,
+                r: 0,
+                g: 255,
+                b: 255,
+            },
+        );
+        assert_color(canvas.image(), 3, 0, blue);
+
+        let shared = SharedImageBuffer::new(4, vec![red, green, blue, black]);
+        let source = shared.clone();
+        let mut canvas = ImageBufferCanvas::new(shared);
+        canvas.draw(0, 0, 3, 1, &source, 1, 0, full_clip(4));
+
+        assert_color(canvas.image(), 0, 0, green);
+        assert_color(canvas.image(), 1, 0, blue);
+        assert_color(canvas.image(), 2, 0, black);
+        assert_color(canvas.image(), 3, 0, black);
+
+        let shared = SharedImageBuffer::new(2, vec![red, green, blue, black, green, red]);
+        let source = shared.clone();
+        let mut canvas = ImageBufferCanvas::new(shared);
+        canvas.draw(
+            0,
+            1,
+            2,
+            2,
+            &source,
+            0,
+            0,
+            Clip {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 3,
+            },
+        );
+
+        assert_color(canvas.image(), 0, 0, red);
+        assert_color(canvas.image(), 1, 0, green);
+        assert_color(canvas.image(), 0, 1, red);
+        assert_color(canvas.image(), 1, 1, green);
+        assert_color(canvas.image(), 0, 2, blue);
+        assert_color(canvas.image(), 1, 2, black);
+    }
+
+    #[test]
+    fn test_pixel_operations_respect_clip_and_invert_the_selected_area() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(3, 1));
+        let clip = Clip {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+
+        canvas.put_pixel(0, 0, BACKGROUND, clip);
+        assert_color(canvas.image(), 0, 0, Color { a: 0, r: 0, g: 0, b: 0 });
+
+        canvas.put_pixel(1, 0, BACKGROUND, clip);
+        assert_color(canvas.image(), 1, 0, BACKGROUND);
+        assert_eq!(canvas.get_pixel(1, 0).map(|color| (color.r, color.g, color.b)), Some((0x12, 0x34, 0x56)));
+        assert!(canvas.get_pixel(3, 0).is_none());
+
+        canvas.invert_rect(0, 0, 3, 1, clip);
+        assert_color(
+            canvas.image(),
+            1,
+            0,
+            Color {
+                a: 255,
+                r: !BACKGROUND.r,
+                g: !BACKGROUND.g,
+                b: !BACKGROUND.b,
+            },
+        );
+        assert_color(canvas.image(), 2, 0, Color { a: 0, r: 0, g: 0, b: 0 });
+    }
+
+    #[test]
+    fn test_invert_rect_preserves_alpha() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(3, 1));
+        for (x, alpha) in [0, 128, 255].into_iter().enumerate() {
+            canvas.put_pixel(
+                x as i32,
+                0,
+                Color {
+                    a: alpha,
+                    r: 0x12,
+                    g: 0x34,
+                    b: 0x56,
+                },
+                full_clip(3),
+            );
+        }
+
+        canvas.invert_rect(0, 0, 3, 1, full_clip(3));
+
+        for (x, alpha) in [0, 128, 255].into_iter().enumerate() {
+            assert_color(
+                canvas.image(),
+                x as i32,
+                0,
+                Color {
+                    a: alpha,
+                    r: !0x12,
+                    g: !0x34,
+                    b: !0x56,
+                },
+            );
+        }
     }
 
     #[test]
@@ -1176,6 +1517,240 @@ mod tests {
         assert!(is_set(&image, 16, 0), "straight top edge should be filled");
         assert!(!is_set(&image, 0, 0), "rounded corner should be empty");
         assert!(!is_set(&image, 31, 0), "rounded corner should be empty");
+    }
+
+    #[test]
+    fn test_clip_intersect_disjoint_is_empty() {
+        let a = Clip {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let b = Clip {
+            x: 20,
+            y: 20,
+            width: 5,
+            height: 5,
+        };
+
+        let result = a.intersect(&b);
+
+        assert_eq!(result.width, 0);
+        assert_eq!(result.height, 0);
+    }
+
+    #[test]
+    fn test_clip_intersect_partial() {
+        let a = Clip {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let b = Clip {
+            x: 5,
+            y: 5,
+            width: 10,
+            height: 10,
+        };
+
+        let result = a.intersect(&b);
+
+        assert_eq!(result.x, 5);
+        assert_eq!(result.y, 5);
+        assert_eq!(result.width, 5);
+        assert_eq!(result.height, 5);
+    }
+
+    #[test]
+    fn test_clip_intersect_extreme_values_no_overflow() {
+        let a = Clip {
+            x: 1,
+            y: 1,
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        let b = Clip {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        let result = a.intersect(&b);
+
+        assert_eq!(result.x, 1);
+        assert_eq!(result.y, 1);
+        assert_eq!(result.width, 9);
+        assert_eq!(result.height, 9);
+    }
+
+    #[test]
+    fn test_draw_rect_clips_edges_independently() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(32, 32));
+        let clip = Clip {
+            x: 0,
+            y: 16,
+            width: 32,
+            height: 16,
+        };
+        canvas.draw_rect(4, 4, 10, 20, WHITE, clip);
+        let image = canvas.into_inner();
+
+        assert!(is_set(&image, 4, 23), "bottom edge inside clip should be drawn");
+        assert!(is_set(&image, 8, 23), "bottom edge interior pixels inside clip should be drawn");
+        assert!(is_set(&image, 13, 23), "bottom edge inside clip should be drawn");
+        assert!(!is_set(&image, 4, 4), "top edge outside clip must not be drawn");
+        assert!(!is_set(&image, 4, 15), "vertical edges above clip must not be drawn");
+        assert!(is_set(&image, 4, 16), "left edge inside clip should be drawn");
+        assert!(is_set(&image, 13, 20), "right edge inside clip should be drawn");
+        assert!(!is_set(&image, 5, 20), "rect interior must not be filled");
+    }
+
+    #[test]
+    fn test_draw_line_includes_endpoint() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+        canvas.draw_line(1, 1, 5, 5, WHITE, full_clip(10));
+        let image = canvas.into_inner();
+
+        assert!(is_set(&image, 1, 1), "start point should be drawn");
+        assert!(is_set(&image, 5, 5), "end point should be drawn");
+    }
+
+    #[test]
+    fn test_draw_line_extreme_coordinates() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+        canvas.draw_line(-2_000_000_000, 5, 2_000_000_000, 5, WHITE, full_clip(10));
+        let image = canvas.into_inner();
+
+        for x in 0..10 {
+            assert!(is_set(&image, x, 5), "visible span of extreme line should be drawn (x={x})");
+        }
+    }
+
+    #[test]
+    fn test_draw_text_respects_clip() {
+        let empty_clip = Clip {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(30, 20));
+        canvas.draw_text("A", 2, 2, TextAlignment::Left, WHITE, empty_clip);
+        let clipped = canvas.into_inner();
+
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(30, 20));
+        canvas.draw_text("A", 2, 2, TextAlignment::Left, WHITE, full_clip(30));
+        let unclipped = canvas.into_inner();
+
+        let count_set = |image: &VecImageBuffer<ArgbPixel>| {
+            (0..20)
+                .flat_map(|y| (0..30).map(move |x| (x, y)))
+                .filter(|&(x, y)| is_set(image, x, y))
+                .count()
+        };
+        assert_eq!(count_set(&clipped), 0, "empty clip must draw nothing");
+        assert!(count_set(&unclipped) > 0, "full clip must draw glyph pixels");
+    }
+
+    #[test]
+    fn test_extreme_dimensions_terminate() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+
+        // must complete quickly and draw only the visible portion, whatever the guest passes
+        canvas.draw_rect(0, 0, u32::MAX, u32::MAX, WHITE, full_clip(10));
+        canvas.fill_rect(-5, -5, u32::MAX, u32::MAX, WHITE, full_clip(10));
+        canvas.draw_rect(2, 2, 0x8000_0000, 5, WHITE, full_clip(10));
+        canvas.fill_arc(0, 0, u32::MAX, u32::MAX, 0, 360, WHITE, full_clip(10));
+        canvas.fill_round_rect(0, 0, u32::MAX, u32::MAX, 4, 4, WHITE, full_clip(10));
+        canvas.draw_round_rect(-100, -100, u32::MAX, u32::MAX, 4, 4, WHITE, full_clip(10));
+        canvas.draw_arc(0, 0, u32::MAX, u32::MAX, 0, 360, WHITE, full_clip(10));
+        canvas.draw(
+            -2_000_000_000,
+            -2_000_000_000,
+            u32::MAX,
+            u32::MAX,
+            &VecImageBuffer::<ArgbPixel>::new(4, 4),
+            0,
+            0,
+            full_clip(10),
+        );
+
+        let image = canvas.into_inner();
+        assert!(is_set(&image, 0, 0), "full-coverage fill must reach the visible area");
+    }
+
+    #[test]
+    fn test_draw_rect_edges_visible_when_partially_offscreen() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+
+        // right/bottom edges far offscreen: only top and left edges are visible
+        canvas.draw_rect(2, 2, 1_000_000, 1_000_000, WHITE, full_clip(10));
+        let image = canvas.into_inner();
+
+        assert!(is_set(&image, 5, 2), "top edge should be drawn");
+        assert!(is_set(&image, 2, 5), "left edge should be drawn");
+        assert!(!is_set(&image, 5, 5), "interior must stay empty");
+    }
+
+    #[test]
+    fn test_draw_rect_xor_toggles_corners_once() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(8, 8));
+        canvas.fill_rect(0, 0, 8, 8, BACKGROUND, full_clip(8));
+        canvas.set_xor_mode(true);
+        canvas.draw_rect(1, 1, 4, 4, XOR_COLOR, full_clip(8));
+
+        let toggled = Color {
+            a: 255,
+            r: BACKGROUND.r ^ XOR_COLOR.r,
+            g: BACKGROUND.g ^ XOR_COLOR.g,
+            b: BACKGROUND.b ^ XOR_COLOR.b,
+        };
+        assert_color(canvas.image(), 1, 1, toggled);
+        assert_color(canvas.image(), 4, 4, toggled);
+        assert_color(canvas.image(), 2, 1, toggled);
+        assert_color(canvas.image(), 1, 2, toggled);
+    }
+
+    #[test]
+    fn test_draw_line_respects_clip() {
+        let clip = Clip {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+        canvas.draw_line(6, 6, 9, 9, WHITE, clip);
+        let image = canvas.into_inner();
+
+        for i in 6..10 {
+            assert!(!is_set(&image, i, i), "line outside clip must not be drawn ({i},{i})");
+        }
+
+        let clip = Clip {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+        canvas.draw_line(0, 0, 9, 9, WHITE, clip);
+        let image = canvas.into_inner();
+
+        assert!(is_set(&image, 2, 2), "part of the line inside clip should be drawn");
+        assert!(!is_set(&image, 5, 5), "part of the line outside clip must not be drawn");
+    }
+
+    #[test]
+    fn test_draw_line_single_point() {
+        let mut canvas = ImageBufferCanvas::new(VecImageBuffer::<ArgbPixel>::new(10, 10));
+        canvas.draw_line(3, 3, 3, 3, WHITE, full_clip(10));
+        let image = canvas.into_inner();
+
+        assert!(is_set(&image, 3, 3));
     }
 
     #[test]

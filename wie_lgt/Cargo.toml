@@ -11,7 +11,10 @@ hooks = ["wie_core_arm/hooks"]
 async-trait = { workspace = true }
 bytemuck = { workspace = true }
 futures = { workspace = true }
+lazy_static = { workspace = true }
+serde = { workspace = true }
 spin = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 
 chrono = { version = "^0.4", default-features = false, features = ["alloc"] }
@@ -21,7 +24,6 @@ java_class_proto = { workspace = true }
 java_constants = { workspace = true }
 java_runtime = { workspace = true }
 jvm = { workspace = true }
-jvm_rust = { workspace = true }
 wipi_types = { workspace = true, features = ["lgt"] }
 
 wie_backend = { workspace = true }

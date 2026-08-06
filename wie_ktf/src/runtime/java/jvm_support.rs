@@ -214,13 +214,13 @@ mod test {
 
     use wie_backend::{DefaultTaskRunner, System};
     use wie_core_arm::{Allocator, ArmCore};
-    use wie_util::Result;
+    use wie_util::{Result, WieError};
 
-    use super::KtfJvmSupport;
+    use super::{JavaArrayClassInstance, JavaClassDefinition, JavaMethod, KtfJvmSupport};
 
     use test_utils::TestPlatform;
 
-    async fn init_jvm(system: &mut System) -> Result<Jvm> {
+    async fn init_jvm(system: &mut System) -> Result<(Jvm, ArmCore)> {
         let mut core = ArmCore::new(false, None)?;
         Allocator::init(&mut core)?;
 
@@ -231,7 +231,7 @@ mod test {
 
         let (jvm, _) = KtfJvmSupport::init(&mut core, system, None).await?;
 
-        Ok(jvm)
+        Ok((jvm, core))
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod test {
         let done_clone = done.clone();
         let mut system_clone = system.clone();
         system.spawn(async move || {
-            let jvm = init_jvm(&mut system_clone).await?;
+            let (jvm, _core) = init_jvm(&mut system_clone).await?;
 
             let string1 = JavaLangString::from_rust_string(&jvm, "test1").await.unwrap();
             let string2 = JavaLangString::from_rust_string(&jvm, "test2").await.unwrap();
@@ -268,6 +268,161 @@ mod test {
             let time: i64 = jvm.invoke_virtual(&date, "getTime", "()J", ()).await.unwrap();
 
             assert_eq!(time, 0x12345678_abcdef01);
+
+            Ok(())
+        });
+
+        loop {
+            system.tick()?;
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_exception_class_matches_raw_class_and_vtable() -> Result<()> {
+        let mut system = System::new(Box::new(TestPlatform::new()), "", "", DefaultTaskRunner);
+
+        let done = Arc::new(AtomicBool::new(false));
+
+        let done_clone = done.clone();
+        let mut system_clone = system.clone();
+        system.spawn(async move || {
+            let (jvm, mut core) = init_jvm(&mut system_clone).await?;
+
+            let exception = jvm.new_class("java/lang/NullPointerException", "()V", ()).await.unwrap();
+            let null_pointer_class = jvm
+                .resolve_class("java/lang/NullPointerException")
+                .await
+                .unwrap()
+                .definition
+                .as_any()
+                .downcast_ref::<JavaClassDefinition>()
+                .unwrap()
+                .clone();
+            let runtime_exception_class = jvm
+                .resolve_class("java/lang/RuntimeException")
+                .await
+                .unwrap()
+                .definition
+                .as_any()
+                .downcast_ref::<JavaClassDefinition>()
+                .unwrap()
+                .clone();
+            let illegal_argument_class = jvm
+                .resolve_class("java/lang/IllegalArgumentException")
+                .await
+                .unwrap()
+                .definition
+                .as_any()
+                .downcast_ref::<JavaClassDefinition>()
+                .unwrap()
+                .clone();
+
+            assert!(JavaMethod::exception_class_matches(&core, &jvm, &*exception, 0)?);
+            assert!(JavaMethod::exception_class_matches(&core, &jvm, &*exception, null_pointer_class.ptr_raw)?);
+            assert!(JavaMethod::exception_class_matches(
+                &core,
+                &jvm,
+                &*exception,
+                null_pointer_class.ptr_vtable()?
+            )?);
+            assert!(JavaMethod::exception_class_matches(
+                &core,
+                &jvm,
+                &*exception,
+                runtime_exception_class.ptr_vtable()?
+            )?);
+            assert!(!JavaMethod::exception_class_matches(
+                &core,
+                &jvm,
+                &*exception,
+                illegal_argument_class.ptr_vtable()?
+            )?);
+
+            let ptr_exception = KtfJvmSupport::class_instance_raw(&exception);
+            let result = JavaMethod::handle_exception(&mut core, &jvm, exception).await;
+            assert!(matches!(result, Err(WieError::JavaException(ptr)) if ptr == ptr_exception));
+
+            done_clone.store(true, Ordering::Relaxed);
+
+            Ok(())
+        });
+
+        loop {
+            system.tick()?;
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_long_array_store_load() -> Result<()> {
+        let mut system = System::new(Box::new(TestPlatform::new()), "", "", DefaultTaskRunner);
+
+        let done = Arc::new(AtomicBool::new(false));
+
+        let done_clone = done.clone();
+        let mut system_clone = system.clone();
+        system.spawn(async move || {
+            let (jvm, core) = init_jvm(&mut system_clone).await?;
+
+            let values = vec![i64::MIN, -1, 0x12345678_9abcdef0, i64::MAX];
+
+            let mut array = jvm.instantiate_array("J", 4).await.unwrap();
+            jvm.store_array(&mut array, 0, values.clone()).await.unwrap();
+            let loaded: Vec<i64> = jvm.load_array(&array, 0, 4).await.unwrap();
+
+            assert_eq!(loaded, values);
+
+            // guard against store/load flipping words symmetrically: check raw guest memory layout
+            let array_instance = JavaArrayClassInstance::from_raw(KtfJvmSupport::class_instance_raw(&array), &core);
+            let mut raw = [0u8; 8];
+            array_instance.load_raw(16, &mut raw)?;
+            assert_eq!(raw, 0x12345678_9abcdef0u64.to_le_bytes());
+
+            done_clone.store(true, Ordering::Relaxed);
+
+            Ok(())
+        });
+
+        loop {
+            system.tick()?;
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_double_array_store_load() -> Result<()> {
+        let mut system = System::new(Box::new(TestPlatform::new()), "", "", DefaultTaskRunner);
+
+        let done = Arc::new(AtomicBool::new(false));
+
+        let done_clone = done.clone();
+        let mut system_clone = system.clone();
+        system.spawn(async move || {
+            let (jvm, _core) = init_jvm(&mut system_clone).await?;
+
+            let values = vec![f64::MIN_POSITIVE, -1.5, f64::MAX];
+
+            let mut array = jvm.instantiate_array("D", 3).await.unwrap();
+            jvm.store_array(&mut array, 0, values.clone()).await.unwrap();
+            let loaded: Vec<f64> = jvm.load_array(&array, 0, 3).await.unwrap();
+
+            let to_bits = |x: &Vec<f64>| x.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(to_bits(&loaded), to_bits(&values));
+
+            done_clone.store(true, Ordering::Relaxed);
 
             Ok(())
         });

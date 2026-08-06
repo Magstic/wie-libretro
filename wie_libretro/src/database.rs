@@ -34,6 +34,32 @@ impl LibretroDatabaseRepository {
 
         self.base_path.join(app_id).join("db").join(normalized_name)
     }
+
+    fn path_for_app_databases(&self, app_id: &str) -> PathBuf {
+        self.path_for_database("_", app_id).parent().unwrap().to_owned()
+    }
+
+    fn directory_usage(path: &std::path::Path) -> u64 {
+        let Ok(entries) = fs::read_dir(path) else {
+            return 0;
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                let Ok(file_type) = entry.file_type() else {
+                    return 0;
+                };
+                if file_type.is_file() {
+                    entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                } else if file_type.is_dir() {
+                    Self::directory_usage(&entry.path())
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
 }
 
 #[async_trait::async_trait]
@@ -57,6 +83,10 @@ impl wie_backend::DatabaseRepository for LibretroDatabaseRepository {
                 false
             }
         }
+    }
+
+    async fn usage(&self, app_id: &str) -> u64 {
+        Self::directory_usage(&self.path_for_app_databases(app_id))
     }
 }
 
