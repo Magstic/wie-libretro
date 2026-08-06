@@ -1,0 +1,134 @@
+name: Core Nightly
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Build ${{ matrix.name }} core
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/wie_libretro.dll
+            artifact: wie-libretro-windows-x86_64
+          - name: Linux x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/libwie_libretro.so
+            artifact: wie-libretro-linux-x86_64
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build core
+        run: cargo build -p wie_libretro --release --target ${{ matrix.target }}
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary }}" dist/
+          cp wie_libretro/wie_libretro.info dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+          if-no-files-found: error
+
+  macos:
+    name: Build macOS universal core
+    runs-on: macos-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build cores
+        run: |
+          cargo build -p wie_libretro --release --target aarch64-apple-darwin
+          cargo build -p wie_libretro --release --target x86_64-apple-darwin
+
+      - name: Collect universal artifact
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/libwie_libretro.dylib \
+            target/x86_64-apple-darwin/release/libwie_libretro.dylib \
+            -output dist/libwie_libretro.dylib
+          cp wie_libretro/wie_libretro.info dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wie-libretro-macos-universal
+          path: dist
+          if-no-files-found: error
+
+  android:
+    name: Build Android ARM64 core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Select preinstalled Android NDK
+        run: |
+          ndk_home=${ANDROID_NDK_LATEST_HOME:-$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)}
+          echo "ANDROID_NDK_HOME=$ndk_home" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ndk_home" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Build core
+        run: cargo ndk -t arm64-v8a -P 29 build -p wie_libretro --release
+
+      - name: Collect artifact
+        run: |
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/libwie_libretro.so dist/
+          cp wie_libretro/wie_libretro.info dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wie-libretro-android-arm64-v8a
+          path: dist
+          if-no-files-found: error
