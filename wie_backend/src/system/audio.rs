@@ -1,98 +1,58 @@
-use alloc::{
-    boxed::Box,
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    vec::Vec,
-};
-use core::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(not(target_arch = "wasm32"))]
-extern crate std;
+use alloc::{boxed::Box, collections::BTreeMap, collections::BTreeSet, sync::Arc, vec, vec::Vec};
 
 use smaf_player::{SmafEvent, parse_smaf};
 
-use crate::{System, audio_sink::AudioSink};
+use crate::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, AudioSink, TimedAudioEvent};
 
-pub type AudioHandle = u32;
 #[derive(Debug)]
 pub enum AudioError {
     InvalidHandle,
-    InvalidAudio,
-}
-
-enum AudioFile {
-    Smaf(Vec<u8>),
 }
 
 pub struct Audio {
-    sink: Arc<Box<dyn AudioSink>>,
-    #[cfg(not(target_arch = "wasm32"))]
-    scheduler: AudioScheduler,
-    files: BTreeMap<AudioHandle, AudioFile>,
-    playing: BTreeMap<AudioHandle, Arc<PlaybackControl>>,
+    sink: Box<dyn AudioSink>,
+    files: BTreeMap<AudioHandle, Arc<AudioSequence>>,
+    playing: BTreeSet<AudioHandle>,
     last_audio_handle: AudioHandle,
 }
 
 impl Audio {
     pub fn new(sink: Box<dyn AudioSink>) -> Self {
         Self {
-            sink: Arc::new(sink),
-            #[cfg(not(target_arch = "wasm32"))]
-            scheduler: AudioScheduler::new(),
+            sink,
             files: BTreeMap::new(),
-            playing: BTreeMap::new(),
+            playing: BTreeSet::new(),
             last_audio_handle: 1,
         }
     }
 
     pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
         let audio_handle = self.last_audio_handle;
+        let sequence = Arc::new(convert_smaf_events(parse_smaf(data)));
 
         self.last_audio_handle += 1;
-        self.files.insert(audio_handle, AudioFile::Smaf(data.to_vec()));
+        self.files.insert(audio_handle, sequence);
 
         Ok(audio_handle)
     }
 
-    pub fn play(&mut self, system: &System, audio_handle: AudioHandle, repeat: bool) -> Result<(), AudioError> {
-        let player = match self.files.get(&audio_handle) {
-            Some(AudioFile::Smaf(data)) => SmafPlayer::new(data)?,
-            None => return Err(AudioError::InvalidHandle),
-        };
+    pub fn play(&mut self, audio_handle: AudioHandle, repeat: bool) -> Result<(), AudioError> {
+        let sequence = self.files.get(&audio_handle).cloned().ok_or(AudioError::InvalidHandle)?;
 
         self.stop(audio_handle);
-
-        let sink_clone = self.sink.clone();
-
-        let playback_control = Arc::new(PlaybackControl::new());
-        self.playing.insert(audio_handle, playback_control.clone());
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = system;
-            self.scheduler
-                .play(NativePlayback::new(player, sink_clone, playback_control, repeat))
-                .map_err(|_| AudioError::InvalidAudio)?;
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut system_clone = system.clone();
-            system.spawn(async move || {
-                player.play(&mut system_clone, &**sink_clone, &playback_control, repeat).await;
-
-                Ok(())
-            });
-        }
+        self.playing.insert(audio_handle);
+        self.sink.send(AudioCommand::Play {
+            handle: audio_handle,
+            sequence,
+            repeat,
+        });
 
         Ok(())
     }
 
     pub fn stop(&mut self, audio_handle: AudioHandle) {
-        if let Some(playback_control) = self.playing.remove(&audio_handle) {
-            playback_control.stop();
-            #[cfg(not(target_arch = "wasm32"))]
-            self.scheduler.wake();
+        if self.playing.remove(&audio_handle) {
+            self.sink.send(AudioCommand::Stop { handle: audio_handle });
         }
     }
 
@@ -107,441 +67,155 @@ impl Audio {
     }
 
     pub fn shutdown(&mut self) {
-        for playback_control in self.playing.values() {
-            playback_control.stop();
-        }
-        self.playing.clear();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        self.scheduler.shutdown();
-    }
-}
-
-struct PlaybackControl {
-    stopped: AtomicBool,
-}
-
-impl PlaybackControl {
-    fn new() -> Self {
-        Self {
-            stopped: AtomicBool::new(false),
+        for handle in core::mem::take(&mut self.playing) {
+            self.sink.send(AudioCommand::Stop { handle });
         }
     }
-
-    fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
-    }
-
-    fn stop(&self) {
-        self.stopped.store(true, Ordering::Relaxed);
-    }
 }
 
-pub struct SmafPlayer {
-    events: Vec<(usize, SmafEvent)>,
-}
-
-impl SmafPlayer {
-    pub fn new(data: &[u8]) -> Result<Self, AudioError> {
-        let events = parse_smaf(data);
-        if events.is_empty() {
-            return Err(AudioError::InvalidAudio);
-        }
-
-        Ok(Self { events })
-    }
-
-    fn can_repeat(&self) -> bool {
-        self.events.iter().any(|(time, event)| *time > 0 || !matches!(event, SmafEvent::End))
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    async fn play(&self, system: &mut System, sink: &dyn AudioSink, playback_control: &PlaybackControl, repeat: bool) {
-        loop {
-            let mut active_notes: Vec<(u8, u8)> = Vec::new();
-            let mut used_channels: BTreeSet<u8> = BTreeSet::new();
-
-            let start_time = system.platform().now();
-            for (time, event) in &self.events {
-                if playback_control.is_stopped() {
-                    break;
+fn convert_smaf_events(events: Vec<(usize, SmafEvent)>) -> AudioSequence {
+    let duration = events.iter().map(|(time, _)| *time as u64).max().unwrap_or(0);
+    let events = events
+        .into_iter()
+        .filter_map(|(time, event)| {
+            let data = match event {
+                SmafEvent::Wave {
+                    channel,
+                    sampling_rate,
+                    data,
+                } => AudioEventData::Wave {
+                    channels: channel,
+                    sampling_rate,
+                    samples: data,
+                },
+                SmafEvent::MidiNoteOn { channel, note, velocity } => AudioEventData::Midi(vec![0x90 | channel, note, velocity]),
+                SmafEvent::MidiNoteOff { channel, note, velocity } => AudioEventData::Midi(vec![0x80 | channel, note, velocity]),
+                SmafEvent::MidiProgramChange { channel, program } => AudioEventData::Midi(vec![0xc0 | channel, program]),
+                SmafEvent::MidiControlChange { channel, control, value } => AudioEventData::Midi(vec![0xb0 | channel, control, value]),
+                SmafEvent::MidiPitchBend { channel, value } => {
+                    AudioEventData::Midi(vec![0xe0 | channel, (value & 0x7f) as u8, ((value >> 7) & 0x7f) as u8])
                 }
+                SmafEvent::MidiSysEx(data) => AudioEventData::Midi(data),
+                SmafEvent::End => return None,
+            };
 
-                let now = system.platform().now();
-                if (*time as u64) > now - start_time {
-                    system.sleep(((*time as u64) - (now - start_time)) as _).await;
+            Some(TimedAudioEvent { time: time as u64, data })
+        })
+        .collect();
 
-                    if playback_control.is_stopped() {
-                        break;
-                    }
-                }
-
-                Self::dispatch_event(event, sink, &mut active_notes, &mut used_channels);
-            }
-
-            Self::finish_playback(sink, &active_notes, &used_channels);
-
-            if !repeat || playback_control.is_stopped() || !self.can_repeat() {
-                break;
-            }
-        }
-    }
-
-    fn dispatch_event(event: &SmafEvent, sink: &dyn AudioSink, active_notes: &mut Vec<(u8, u8)>, used_channels: &mut BTreeSet<u8>) {
-        match event {
-            SmafEvent::Wave {
-                channel,
-                sampling_rate,
-                data,
-            } => sink.play_wave(*channel, *sampling_rate, data),
-            SmafEvent::MidiNoteOn { channel, note, velocity } => {
-                sink.midi_note_on(*channel, *note, *velocity);
-                active_notes.push((*channel, *note));
-                used_channels.insert(*channel);
-            }
-            SmafEvent::MidiNoteOff { channel, note, velocity } => {
-                sink.midi_note_off(*channel, *note, *velocity);
-                active_notes.retain(|(c, n)| !(*c == *channel && *n == *note));
-            }
-            SmafEvent::MidiProgramChange { channel, program } => {
-                sink.midi_program_change(*channel, *program);
-                used_channels.insert(*channel);
-            }
-            SmafEvent::MidiControlChange { channel, control, value } => {
-                sink.midi_control_change(*channel, *control, *value);
-                used_channels.insert(*channel);
-            }
-            SmafEvent::MidiPitchBend { channel, value } => {
-                sink.midi_pitch_bend(*channel, *value);
-                used_channels.insert(*channel);
-            }
-            SmafEvent::MidiSysEx(data) => sink.midi_sysex(data),
-            SmafEvent::End => {}
-        }
-    }
-
-    fn finish_playback(sink: &dyn AudioSink, active_notes: &[(u8, u8)], used_channels: &BTreeSet<u8>) {
-        for (channel, note) in active_notes {
-            sink.midi_note_off(*channel, *note, 0);
-        }
-
-        for channel in used_channels {
-            sink.midi_control_change(*channel, 64, 0);
-            sink.midi_control_change(*channel, 120, 0);
-            sink.midi_control_change(*channel, 123, 0);
-        }
-    }
+    AudioSequence { duration, events }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-struct AudioScheduler {
-    sender: std::sync::mpsc::Sender<AudioSchedulerCommand>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-enum AudioSchedulerCommand {
-    Play(NativePlayback),
-    Wake,
-    Stop,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl AudioScheduler {
-    fn new() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let worker = std::thread::Builder::new()
-            .name("wie-audio-scheduler".into())
-            .spawn(move || {
-                use std::sync::mpsc::RecvTimeoutError;
-                use std::time::{Duration, Instant};
-
-                let mut playbacks: Vec<NativePlayback> = Vec::new();
-                loop {
-                    let now = Instant::now();
-                    let mut index = 0;
-                    while index < playbacks.len() {
-                        if playbacks[index].advance(now) {
-                            playbacks.remove(index);
-                        } else {
-                            index += 1;
-                        }
-                    }
-
-                    let timeout = playbacks
-                        .iter()
-                        .map(|playback| playback.next_due().saturating_duration_since(now))
-                        .min()
-                        .unwrap_or(Duration::from_secs(60));
-                    match receiver.recv_timeout(timeout) {
-                        Ok(AudioSchedulerCommand::Play(playback)) => playbacks.push(playback),
-                        Ok(AudioSchedulerCommand::Wake) | Err(RecvTimeoutError::Timeout) => {}
-                        Ok(AudioSchedulerCommand::Stop) => {
-                            for playback in &mut playbacks {
-                                playback.finish();
-                            }
-                            return;
-                        }
-                        Err(RecvTimeoutError::Disconnected) => {
-                            for playback in &mut playbacks {
-                                playback.finish();
-                            }
-                            return;
-                        }
-                    }
-                }
-            })
-            .expect("failed to start audio scheduler thread");
-
-        Self {
-            sender,
-            worker: Some(worker),
-        }
-    }
-
-    fn play(&self, playback: NativePlayback) -> core::result::Result<(), ()> {
-        self.sender.send(AudioSchedulerCommand::Play(playback)).map_err(|_| ())
-    }
-
-    fn wake(&self) {
-        let _ = self.sender.send(AudioSchedulerCommand::Wake);
-    }
-
-    fn shutdown(&mut self) {
-        let _ = self.sender.send(AudioSchedulerCommand::Stop);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for AudioScheduler {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct NativePlayback {
-    player: SmafPlayer,
-    sink: Arc<Box<dyn AudioSink>>,
-    control: Arc<PlaybackControl>,
-    repeat: bool,
-    event_index: usize,
-    start_time: std::time::Instant,
-    active_notes: Vec<(u8, u8)>,
-    used_channels: BTreeSet<u8>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl NativePlayback {
-    fn new(player: SmafPlayer, sink: Arc<Box<dyn AudioSink>>, control: Arc<PlaybackControl>, repeat: bool) -> Self {
-        Self {
-            player,
-            sink,
-            control,
-            repeat,
-            event_index: 0,
-            start_time: std::time::Instant::now(),
-            active_notes: Vec::new(),
-            used_channels: BTreeSet::new(),
-        }
-    }
-
-    fn next_due(&self) -> std::time::Instant {
-        let Some((time, _)) = self.player.events.get(self.event_index) else {
-            return std::time::Instant::now();
-        };
-        self.start_time
-            .checked_add(std::time::Duration::from_millis(*time as u64))
-            .unwrap_or(self.start_time)
-    }
-
-    fn advance(&mut self, now: std::time::Instant) -> bool {
-        loop {
-            if self.control.is_stopped() {
-                self.finish();
-                return true;
-            }
-
-            if self.event_index == self.player.events.len() {
-                self.finish();
-                if !self.repeat || !self.player.can_repeat() {
-                    return true;
-                }
-
-                self.event_index = 0;
-                self.start_time = now;
-                continue;
-            }
-
-            if now < self.next_due() {
-                return false;
-            }
-
-            let (_, event) = &self.player.events[self.event_index];
-            SmafPlayer::dispatch_event(event, &**self.sink, &mut self.active_notes, &mut self.used_channels);
-            self.event_index += 1;
-        }
-    }
-
-    fn finish(&mut self) {
-        SmafPlayer::finish_playback(&**self.sink, &self.active_notes, &self.used_channels);
-        self.active_notes.clear();
-        self.used_channels.clear();
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
+    extern crate std;
+
     use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-    use std::{sync::Mutex as StdMutex, time::Instant};
+    use std::sync::Mutex;
 
-    use super::*;
-    use crate::AudioSink;
+    use smaf_player::SmafEvent;
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum RecordedEvent {
-        NoteOn(u8, u8),
-        NoteOff(u8, u8),
-    }
+    use super::{Audio, convert_smaf_events};
+    use crate::{AudioCommand, AudioEventData, AudioSequence, AudioSink, TimedAudioEvent};
 
-    struct RecordingSink {
-        events: Arc<StdMutex<Vec<(Instant, RecordedEvent)>>>,
-    }
+    struct RecordingSink(Arc<Mutex<Vec<AudioCommand>>>);
 
     impl AudioSink for RecordingSink {
-        fn play_wave(&self, _channel: u8, _sampling_rate: u32, _wave_data: &[i16]) {}
-
-        fn midi_note_on(&self, channel_id: u8, note: u8, _velocity: u8) {
-            self.events
-                .lock()
-                .unwrap()
-                .push((Instant::now(), RecordedEvent::NoteOn(channel_id, note)));
+        fn send(&self, command: AudioCommand) {
+            self.0.lock().unwrap().push(command);
         }
-
-        fn midi_note_off(&self, channel_id: u8, note: u8, _velocity: u8) {
-            self.events
-                .lock()
-                .unwrap()
-                .push((Instant::now(), RecordedEvent::NoteOff(channel_id, note)));
-        }
-
-        fn midi_program_change(&self, _channel_id: u8, _program: u8) {}
-
-        fn midi_control_change(&self, _channel_id: u8, _control: u8, _value: u8) {}
-
-        fn midi_pitch_bend(&self, _channel_id: u8, _value: u16) {}
-
-        fn midi_sysex(&self, _data: &[u8]) {}
-    }
-
-    fn playback(events: Vec<(usize, SmafEvent)>, sink: Arc<Box<dyn AudioSink>>, control: Arc<PlaybackControl>) -> NativePlayback {
-        NativePlayback::new(SmafPlayer { events }, sink, control, false)
     }
 
     #[test]
-    fn audio_handle_zero_is_reserved() {
-        let audio = Audio::new(Box::new(RecordingSink {
-            events: Arc::new(StdMutex::new(Vec::new())),
-        }));
+    fn reserves_zero_audio_handle() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut audio = Audio::new(Box::new(RecordingSink(commands)));
 
-        assert_eq!(audio.last_audio_handle, 1);
+        assert_eq!(audio.load_smaf(&[]).unwrap(), 1);
     }
 
     #[test]
-    fn native_scheduler_dispatches_note_off_without_system_ticks() {
-        let recorded = Arc::new(StdMutex::new(Vec::new()));
-        let sink: Arc<Box<dyn AudioSink>> = Arc::new(Box::new(RecordingSink { events: recorded.clone() }));
-        let control = Arc::new(PlaybackControl::new());
-        let scheduler = AudioScheduler::new();
+    fn converts_smaf_events_to_timed_transport() {
+        let sequence = convert_smaf_events(vec![
+            (5, SmafEvent::MidiProgramChange { channel: 2, program: 7 }),
+            (10, SmafEvent::MidiPitchBend { channel: 3, value: 0x1234 }),
+            (15, SmafEvent::End),
+        ]);
 
-        scheduler
-            .play(playback(
-                vec![
-                    (
-                        0,
-                        SmafEvent::MidiNoteOn {
-                            channel: 0,
-                            note: 60,
-                            velocity: 100,
-                        },
-                    ),
-                    (
-                        30,
-                        SmafEvent::MidiNoteOff {
-                            channel: 0,
-                            note: 60,
-                            velocity: 0,
-                        },
-                    ),
+        assert_eq!(
+            sequence,
+            AudioSequence {
+                duration: 15,
+                events: vec![
+                    TimedAudioEvent {
+                        time: 5,
+                        data: AudioEventData::Midi(vec![0xc2, 7]),
+                    },
+                    TimedAudioEvent {
+                        time: 10,
+                        data: AudioEventData::Midi(vec![0xe3, 0x34, 0x24]),
+                    },
                 ],
-                sink,
-                control,
-            ))
-            .unwrap();
-
-        let timeout = Instant::now() + std::time::Duration::from_secs(1);
-        while recorded.lock().unwrap().len() < 2 && Instant::now() < timeout {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-
-        let events = recorded.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].1, RecordedEvent::NoteOn(0, 60));
-        assert_eq!(events[1].1, RecordedEvent::NoteOff(0, 60));
-        assert!(events[1].0.duration_since(events[0].0) >= std::time::Duration::from_millis(20));
+            }
+        );
     }
 
     #[test]
-    fn stopping_playback_wakes_scheduler_and_releases_active_note() {
-        let recorded = Arc::new(StdMutex::new(Vec::new()));
-        let sink: Arc<Box<dyn AudioSink>> = Arc::new(Box::new(RecordingSink { events: recorded.clone() }));
-        let control = Arc::new(PlaybackControl::new());
-        let scheduler = AudioScheduler::new();
+    fn replay_stops_previous_playback_before_starting_again() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut audio = Audio::new(Box::new(RecordingSink(commands.clone())));
+        let handle = audio.load_smaf(&[]).unwrap();
 
-        scheduler
-            .play(playback(
-                vec![
-                    (
-                        0,
-                        SmafEvent::MidiNoteOn {
-                            channel: 0,
-                            note: 64,
-                            velocity: 100,
-                        },
-                    ),
-                    (
-                        10_000,
-                        SmafEvent::MidiNoteOff {
-                            channel: 0,
-                            note: 64,
-                            velocity: 0,
-                        },
-                    ),
-                ],
-                sink,
-                control.clone(),
-            ))
-            .unwrap();
+        audio.play(handle, false).unwrap();
+        audio.play(handle, true).unwrap();
 
-        let note_on_timeout = Instant::now() + std::time::Duration::from_secs(1);
-        while recorded.lock().unwrap().is_empty() && Instant::now() < note_on_timeout {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert_eq!(recorded.lock().unwrap().first().map(|event| event.1), Some(RecordedEvent::NoteOn(0, 64)));
+        let commands = commands.lock().unwrap();
+        let AudioCommand::Play {
+            sequence: first_sequence,
+            repeat: false,
+            ..
+        } = &commands[0]
+        else {
+            panic!("expected initial play command");
+        };
+        assert_eq!(commands[1], AudioCommand::Stop { handle });
+        let AudioCommand::Play {
+            sequence: second_sequence,
+            repeat: true,
+            ..
+        } = &commands[2]
+        else {
+            panic!("expected replay command");
+        };
+        assert!(Arc::ptr_eq(first_sequence, second_sequence));
+    }
 
-        let stopped_at = Instant::now();
-        control.stop();
-        scheduler.wake();
-        let note_off_timeout = stopped_at + std::time::Duration::from_millis(500);
-        while recorded.lock().unwrap().len() < 2 && Instant::now() < note_off_timeout {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+    #[test]
+    fn close_stops_playback_and_removes_the_handle() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut audio = Audio::new(Box::new(RecordingSink(commands.clone())));
+        let handle = audio.load_smaf(&[]).unwrap();
 
-        let events = recorded.lock().unwrap();
-        assert_eq!(events.last().map(|event| event.1), Some(RecordedEvent::NoteOff(0, 64)));
-        assert!(events.last().unwrap().0.duration_since(stopped_at) < std::time::Duration::from_millis(500));
+        audio.play(handle, false).unwrap();
+        audio.close(handle).unwrap();
+
+        assert_eq!(commands.lock().unwrap()[1], AudioCommand::Stop { handle });
+        assert!(audio.play(handle, false).is_err());
+    }
+
+    #[test]
+    fn shutdown_stops_all_playback() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let mut audio = Audio::new(Box::new(RecordingSink(commands.clone())));
+        let first = audio.load_smaf(&[]).unwrap();
+        let second = audio.load_smaf(&[]).unwrap();
+        audio.play(first, false).unwrap();
+        audio.play(second, false).unwrap();
+
+        audio.shutdown();
+
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands[2], AudioCommand::Stop { handle: first });
+        assert_eq!(commands[3], AudioCommand::Stop { handle: second });
     }
 }

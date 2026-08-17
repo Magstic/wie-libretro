@@ -13,7 +13,7 @@ use wie_backend::{AudioSink, DatabaseRepository, Filesystem, Instant, Platform, 
 use wie_util::Result;
 
 use crate::{
-    audio::LibretroAudioSink,
+    audio::{AudioCommandSender, LibretroAudioSink},
     database::LibretroDatabaseRepository,
     ffi::{RETRO_LOG_ERROR, RETRO_LOG_INFO, RetroLogPrintfT},
     filesystem::LibretroFilesystem,
@@ -29,12 +29,13 @@ pub struct LibretroPlatform {
     screen: LibretroScreen,
     filesystem: LibretroFilesystem,
     database_repository: LibretroDatabaseRepository,
+    audio_tx: AudioCommandSender,
     shared: Arc<Shared>,
     log: LogInterface,
 }
 
 impl LibretroPlatform {
-    pub fn new(width: u32, height: u32, save_dir: PathBuf, shared: Arc<Shared>, log: LogInterface) -> Self {
+    pub fn new(width: u32, height: u32, save_dir: PathBuf, shared: Arc<Shared>, audio_tx: AudioCommandSender, log: LogInterface) -> Self {
         Self {
             screen: LibretroScreen {
                 width,
@@ -43,6 +44,7 @@ impl LibretroPlatform {
             },
             filesystem: LibretroFilesystem::new(save_dir.clone()),
             database_repository: LibretroDatabaseRepository::new(save_dir),
+            audio_tx,
             shared,
             log,
         }
@@ -70,7 +72,7 @@ impl Platform for LibretroPlatform {
     }
 
     fn audio_sink(&self) -> Box<dyn AudioSink> {
-        Box::new(LibretroAudioSink::new(self.shared.audio.clone(), self.shared.midi.clone()))
+        Box::new(LibretroAudioSink::new(self.audio_tx.clone()))
     }
 
     fn write_stdout(&self, buf: &[u8]) {

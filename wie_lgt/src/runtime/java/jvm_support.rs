@@ -8,7 +8,7 @@ mod method;
 mod value;
 mod vtable;
 
-use alloc::{boxed::Box, string::String};
+use alloc::{boxed::Box, format, string::String};
 
 use jvm::{ClassDefinition, ClassInstance, JavaError, Jvm, Method};
 
@@ -24,8 +24,14 @@ use super::classes::net::wie::{CletWrapper, CletWrapperCard, CletWrapperContext,
 use jvm_implementation::LgtJvmImplementation;
 
 use self::{
-    array_class_definition::JavaArrayClassDefinition, array_class_instance::JavaArrayClassInstance, class_definition::JavaClassDefinition,
-    class_instance::JavaClassInstance, field::JavaField, method::JavaMethod, value::JavaValueCodec, vtable::JavaVtableEntry,
+    array_class_definition::JavaArrayClassDefinition,
+    array_class_instance::JavaArrayClassInstance,
+    class_definition::JavaClassDefinition,
+    class_instance::JavaClassInstance,
+    field::{JavaField, JavaReferenceField, JavaStaticReferenceField},
+    method::JavaMethod,
+    value::JavaValueCodec,
+    vtable::JavaVtableEntry,
 };
 
 type LgtJvmWord = u32;
@@ -90,21 +96,18 @@ impl LgtJvmSupport {
         loop {
             let class = jvm
                 .get_class(&current_name)
-                .ok_or_else(|| WieError::FatalError(alloc::format!("Class not loaded while linking field: {current_name}")))?;
+                .ok_or_else(|| WieError::FatalError(format!("Class not loaded while linking field: {current_name}")))?;
             if let Some(field) = class.definition.field(name, descriptor, is_static) {
                 let field = field
                     .as_any()
                     .downcast_ref::<JavaField>()
-                    .ok_or_else(|| WieError::FatalError(alloc::format!("Unsupported field implementation for {current_name}.{name}{descriptor}")))?;
-                return u16::try_from(field.word_index()?).map_err(|_| {
-                    WieError::FatalError(alloc::format!(
-                        "Field word index does not fit LGT ABI for {current_name}.{name}{descriptor}"
-                    ))
-                });
+                    .ok_or_else(|| WieError::FatalError(format!("Unsupported field implementation for {current_name}.{name}{descriptor}")))?;
+                return u16::try_from(field.word_index()?)
+                    .map_err(|_| WieError::FatalError(format!("Field word index does not fit LGT ABI for {current_name}.{name}{descriptor}")));
             }
 
             let Some(parent_name) = class.definition.super_class_name() else {
-                return Err(WieError::FatalError(alloc::format!(
+                return Err(WieError::FatalError(format!(
                     "Unable to resolve {} field {class_name}.{name}{descriptor}",
                     if is_static { "static" } else { "instance" }
                 )));
@@ -116,16 +119,12 @@ impl LgtJvmSupport {
     pub async fn virtual_method_index(jvm: &Jvm, class_name: &str, name: &str, descriptor: &str) -> Result<u16> {
         let class = jvm
             .get_class(class_name)
-            .ok_or_else(|| WieError::FatalError(alloc::format!("Class not loaded while linking virtual method: {class_name}")))?;
+            .ok_or_else(|| WieError::FatalError(format!("Class not loaded while linking virtual method: {class_name}")))?;
         let definition = class
             .definition
             .as_any()
             .downcast_ref::<JavaClassDefinition>()
-            .ok_or_else(|| {
-                WieError::FatalError(alloc::format!(
-                    "Unsupported class implementation while linking virtual method: {class_name}"
-                ))
-            })?
+            .ok_or_else(|| WieError::FatalError(format!("Unsupported class implementation while linking virtual method: {class_name}")))?
             .clone();
         let mut methods = definition.vtable_entries(jvm).await?;
         if let Some(index) = methods.iter().position(|entry| {
@@ -134,11 +133,8 @@ impl LgtJvmSupport {
                 .as_ref()
                 .is_some_and(|method| method.name() == name && method.descriptor() == descriptor)
         }) {
-            return u16::try_from(index).map_err(|_| {
-                WieError::FatalError(alloc::format!(
-                    "Virtual method index does not fit LGT ABI for {class_name}.{name}{descriptor}"
-                ))
-            });
+            return u16::try_from(index)
+                .map_err(|_| WieError::FatalError(format!("Virtual method index does not fit LGT ABI for {class_name}.{name}{descriptor}")));
         }
 
         // TODO Remove this fallback once data/lgt_java_abi.toml covers every linked virtual method.
@@ -146,17 +142,17 @@ impl LgtJvmSupport {
         let method = loop {
             let class = jvm
                 .get_class(&current_name)
-                .ok_or_else(|| WieError::FatalError(alloc::format!("Class not loaded while linking virtual method: {current_name}")))?;
+                .ok_or_else(|| WieError::FatalError(format!("Class not loaded while linking virtual method: {current_name}")))?;
             if let Some(method) = class.definition.method(name, descriptor, false) {
                 break method
                     .as_any()
                     .downcast_ref::<JavaMethod>()
-                    .ok_or_else(|| WieError::FatalError(alloc::format!("Unsupported method implementation for {current_name}.{name}{descriptor}")))?
+                    .ok_or_else(|| WieError::FatalError(format!("Unsupported method implementation for {current_name}.{name}{descriptor}")))?
                     .clone();
             }
 
             let Some(parent_name) = class.definition.super_class_name() else {
-                return Err(WieError::FatalError(alloc::format!(
+                return Err(WieError::FatalError(format!(
                     "Unable to resolve virtual method {class_name}.{name}{descriptor}"
                 )));
             };
@@ -170,11 +166,22 @@ impl LgtJvmSupport {
         });
         definition.set_vtable_entries(&methods)?;
 
-        u16::try_from(index).map_err(|_| {
-            WieError::FatalError(alloc::format!(
-                "Virtual method index does not fit LGT ABI for {class_name}.{name}{descriptor}"
-            ))
-        })
+        u16::try_from(index)
+            .map_err(|_| WieError::FatalError(format!("Virtual method index does not fit LGT ABI for {class_name}.{name}{descriptor}")))
+    }
+
+    pub async fn interface_dispatch_table(jvm: &mut Jvm, class_name: &str) -> Result<u32> {
+        let class = jvm
+            .resolve_class(class_name)
+            .await
+            .map_err(|JavaError::JavaException(instance)| WieError::JavaException(Self::class_instance_raw(&*instance)))?;
+        let definition = class
+            .definition
+            .as_any()
+            .downcast_ref::<JavaClassDefinition>()
+            .ok_or_else(|| WieError::FatalError(format!("Unsupported interface class implementation: {class_name}")))?;
+
+        definition.ptr_vtable()
     }
 
     pub fn non_virtual_method_target(jvm: &Jvm, class_name: &str, name: &str, descriptor: &str) -> Result<u32> {
@@ -182,7 +189,7 @@ impl LgtJvmSupport {
         loop {
             let class = jvm
                 .get_class(&current_name)
-                .ok_or_else(|| WieError::FatalError(alloc::format!("Class not loaded while linking direct method: {current_name}")))?;
+                .ok_or_else(|| WieError::FatalError(format!("Class not loaded while linking direct method: {current_name}")))?;
             if let Some(method) = class
                 .definition
                 .method(name, descriptor, true)
@@ -191,12 +198,12 @@ impl LgtJvmSupport {
                 let method = method
                     .as_any()
                     .downcast_ref::<JavaMethod>()
-                    .ok_or_else(|| WieError::FatalError(alloc::format!("Unsupported method implementation for {current_name}.{name}{descriptor}")))?;
+                    .ok_or_else(|| WieError::FatalError(format!("Unsupported method implementation for {current_name}.{name}{descriptor}")))?;
                 return method.target();
             }
 
             let Some(parent_name) = class.definition.super_class_name() else {
-                return Err(WieError::FatalError(alloc::format!(
+                return Err(WieError::FatalError(format!(
                     "Unable to resolve non-virtual method {class_name}.{name}{descriptor}"
                 )));
             };
@@ -207,12 +214,12 @@ impl LgtJvmSupport {
     pub fn class_getter_targets(jvm: &Jvm, class_name: &str) -> Result<(u32, u32)> {
         let class = jvm
             .get_class(class_name)
-            .ok_or_else(|| WieError::FatalError(alloc::format!("Class not loaded while linking class getters: {class_name}")))?;
-        let definition = class.definition.as_any().downcast_ref::<JavaClassDefinition>().ok_or_else(|| {
-            WieError::FatalError(alloc::format!(
-                "Unsupported class implementation while linking class getters: {class_name}"
-            ))
-        })?;
+            .ok_or_else(|| WieError::FatalError(format!("Class not loaded while linking class getters: {class_name}")))?;
+        let definition = class
+            .definition
+            .as_any()
+            .downcast_ref::<JavaClassDefinition>()
+            .ok_or_else(|| WieError::FatalError(format!("Unsupported class implementation while linking class getters: {class_name}")))?;
         let descriptor = definition.descriptor()?;
         Ok((descriptor.fn_get_initialized_class, descriptor.fn_get_class))
     }
@@ -221,6 +228,7 @@ impl LgtJvmSupport {
         core: &mut ArmCore,
         jvm: &Jvm,
         ptr_class: u32,
+        generated_classes: u32,
         loader: Box<dyn ClassInstance>,
     ) -> Result<Box<dyn ClassInstance>> {
         let mut definition = JavaClassDefinition::from_raw(ptr_class, core);
@@ -235,13 +243,13 @@ impl LgtJvmSupport {
             {
                 return Ok(existing.java_class());
             }
-            return Err(wie_util::WieError::FatalError(alloc::format!(
+            return Err(wie_util::WieError::FatalError(format!(
                 "Class {class_name} is already registered from a different definition"
             )));
         }
 
         let previous_link_state = definition.descriptor()?.link_state;
-        definition.prepare_generated(core, jvm).await?;
+        definition.prepare_generated(core, jvm, generated_classes).await?;
         let registered_definition = definition.clone();
         let mut java_class = match jvm.register_class(Box::new(definition), Some(loader)).await {
             Ok(Some(java_class)) => java_class,
@@ -250,7 +258,7 @@ impl LgtJvmSupport {
                 return Err(wie_util::WieError::JavaException(JavaValueCodec::new(core).object_to_raw(&*instance)));
             }
         };
-        registered_definition.initialize_class_object(jvm, &mut java_class).await?;
+        registered_definition.bind_class_object_storage(jvm, &mut java_class).await?;
         registered_definition.set_link_state(3)?;
 
         let fn_link_members = registered_definition.descriptor()?.fn_link_members;
@@ -274,16 +282,20 @@ mod tests {
     };
 
     use java_class_proto::{JavaClassProto, JavaFieldProto, JavaMethodProto};
-    use java_constants::FieldAccessFlags;
+    use java_constants::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
     use java_runtime::classes::java::lang::String;
     use jvm::{Array, ClassDefinition, ClassInstance, ClassInstanceRef, JavaValue, Jvm, Method, Result as JvmResult, runtime::JavaLangString};
-    use wipi_types::lgt::java::{LgtJavaClass as RawJavaClass, LgtJavaClassField as RawJavaField, LgtJavaClassInstance as RawJavaClassInstance};
+    use wipi_types::lgt::java::{
+        LGT_JAVA_CLASS_SUPER_CLASS_IS_NAME, LgtJavaClass as RawJavaClass, LgtJavaClassDescriptor as RawJavaClassDescriptor,
+        LgtJavaClassField as RawJavaField, LgtJavaClassInstance as RawJavaClassInstance, LgtJavaClassMethod as RawJavaMethod,
+        LgtJavaInterfaceReference as RawJavaInterfaceReference, LgtJavaInterfaceReferences as RawJavaInterfaceReferences,
+    };
 
     use test_utils::TestPlatform;
     use wie_backend::{DefaultTaskRunner, System};
     use wie_core_arm::{Allocator, ArmCore};
     use wie_jvm_support::{JvmImplementation, JvmSupport};
-    use wie_util::{Result, WieError, read_generic, write_generic};
+    use wie_util::{ByteRead, ByteWrite, Result, WieError, read_generic, write_generic, write_null_terminated_string_bytes};
 
     use crate::runtime::java::abi::{CLASS_INITIALIZATION_STATE_FIELD, CLASS_NATIVE_NAME_FIELD, WORD_FIELD_DESCRIPTOR};
 
@@ -355,15 +367,21 @@ mod tests {
             let first = JavaLangString::from_rust_string(&jvm, "lgt").await.unwrap();
             let second = JavaLangString::from_rust_string(&jvm, "-native").await.unwrap();
             let combined = jvm
-                .invoke_virtual(&first, "concat", "(Ljava/lang/String;)Ljava/lang/String;", [second.into()])
+                .invoke_virtual(
+                    &first,
+                    "java/lang/String",
+                    "concat",
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    [second.into()],
+                )
                 .await
                 .unwrap();
             assert_eq!(JavaLangString::to_rust_string(&jvm, &combined).await.unwrap(), "lgt-native");
-            let invalid_char: JvmResult<u16> = jvm.invoke_virtual(&first, "charAt", "(I)C", (i32::MAX,)).await;
+            let invalid_char: JvmResult<u16> = jvm.invoke_virtual(&first, "java/lang/String", "charAt", "(I)C", (i32::MAX,)).await;
             assert!(invalid_char.is_err());
 
             let date: Box<dyn ClassInstance> = jvm.new_class("java/util/Date", "(J)V", (0x12345678_abcdef01i64,)).await.unwrap();
-            let time: i64 = jvm.invoke_virtual(&date, "getTime", "()J", ()).await.unwrap();
+            let time: i64 = jvm.invoke_virtual(&date, "java/util/Date", "getTime", "()J", ()).await.unwrap();
             assert_eq!(time, 0x12345678_abcdef01);
 
             let native_date = date.as_any().downcast_ref::<JavaClassInstance>().unwrap();
@@ -445,10 +463,33 @@ mod tests {
             let string_methods = string_definition.vtable_entries(&jvm).await?;
             assert_eq!(string_methods[10].method.as_ref().unwrap().name(), "length");
             assert_eq!(string_methods[11].method.as_ref().unwrap().name(), "charAt");
+            assert_eq!(string_methods[14].method.as_ref().unwrap().name(), "getBytes");
             assert_eq!(string_methods[28].method.as_ref().unwrap().name(), "substring");
-            for index in [10usize, 11, 28] {
+            for index in [10usize, 11, 14, 28] {
                 let target: u32 = read_generic(&core, string_definition.ptr_vtable()? + ((index + 1) * 4) as u32)?;
                 assert_eq!(target, string_methods[index].method.as_ref().unwrap().target()?);
+            }
+
+            let vector_definition = jvm
+                .resolve_class("java/util/Vector")
+                .await
+                .unwrap()
+                .definition
+                .as_any()
+                .downcast_ref::<super::JavaClassDefinition>()
+                .unwrap()
+                .clone();
+            let vector_methods = vector_definition.vtable_entries(&jvm).await?;
+            for (index, name, descriptor) in [
+                (15usize, "size", "()I"),
+                (23, "elementAt", "(I)Ljava/lang/Object;"),
+                (27, "removeElementAt", "(I)V"),
+                (28, "insertElementAt", "(Ljava/lang/Object;I)V"),
+            ] {
+                let method = vector_methods[index].method.as_ref().unwrap();
+                assert_eq!((method.name().as_str(), method.descriptor().as_str()), (name, descriptor));
+                let target: u32 = read_generic(&core, vector_definition.ptr_vtable()? + ((index + 1) * 4) as u32)?;
+                assert_eq!(target, method.target()?);
             }
 
             let reader_definition = jvm
@@ -499,7 +540,10 @@ mod tests {
                 .await
                 .unwrap();
             let chars = jvm.instantiate_array("C", input.len()).await.unwrap();
-            let read: i32 = jvm.invoke_virtual(&reader, "read", "([C)I", (chars.clone(),)).await.unwrap();
+            let read: i32 = jvm
+                .invoke_virtual(&reader, "java/io/Reader", "read", "([C)I", (chars.clone(),))
+                .await
+                .unwrap();
             assert!(read > 0 && read as usize <= input.len());
             assert_eq!(
                 jvm.load_array::<u16>(&chars, 0, read as usize).await.unwrap(),
@@ -513,9 +557,9 @@ mod tests {
                         name: "net/wie/test/Base",
                         parent_class: Some("java/lang/Object"),
                         interfaces: vec![],
-                        methods: vec![JavaMethodProto::new("value", "()I", base_value, Default::default())],
+                        methods: vec![JavaMethodProto::new("value", "()I", base_value, MethodAccessFlags::PUBLIC)],
                         fields: vec![],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -534,9 +578,9 @@ mod tests {
                         name: "net/wie/test/Child",
                         parent_class: Some("net/wie/test/Base"),
                         interfaces: vec![],
-                        methods: vec![JavaMethodProto::new("value", "()I", child_value, Default::default())],
+                        methods: vec![JavaMethodProto::new("value", "()I", child_value, MethodAccessFlags::PUBLIC)],
                         fields: vec![],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -545,7 +589,7 @@ mod tests {
             jvm.register_class(child_class, None).await.unwrap();
 
             let child = jvm.instantiate_class("net/wie/test/Child").await.unwrap();
-            let value: i32 = jvm.invoke_virtual(&child, "value", "()I", ()).await.unwrap();
+            let value: i32 = jvm.invoke_virtual(&child, "net/wie/test/Base", "value", "()I", ()).await.unwrap();
             assert_eq!(value, 2);
 
             let interface_class = implementation
@@ -557,7 +601,7 @@ mod tests {
                         interfaces: vec!["java/lang/Runnable", "java/lang/Cloneable"],
                         methods: vec![],
                         fields: vec![],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -582,13 +626,13 @@ mod tests {
                         parent_class: Some("org/kwis/msp/lcdui/Jlet"),
                         interfaces: vec![],
                         methods: vec![
-                            JavaMethodProto::new("startApp", "([Ljava/lang/String;)V", jlet_start, Default::default()),
-                            JavaMethodProto::new("pauseApp", "()V", jlet_pause, Default::default()),
-                            JavaMethodProto::new("resumeApp", "()V", jlet_resume, Default::default()),
-                            JavaMethodProto::new("destroyApp", "(Z)V", jlet_destroy, Default::default()),
+                            JavaMethodProto::new("startApp", "([Ljava/lang/String;)V", jlet_start, MethodAccessFlags::PROTECTED),
+                            JavaMethodProto::new("pauseApp", "()V", jlet_pause, MethodAccessFlags::PROTECTED),
+                            JavaMethodProto::new("resumeApp", "()V", jlet_resume, MethodAccessFlags::PROTECTED),
+                            JavaMethodProto::new("destroyApp", "(Z)V", jlet_destroy, MethodAccessFlags::PROTECTED),
                         ],
                         fields: vec![],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -616,9 +660,9 @@ mod tests {
                         name: "net/wie/test/DeepJlet",
                         parent_class: Some("net/wie/test/DirectJlet"),
                         interfaces: vec![],
-                        methods: vec![JavaMethodProto::new("pauseApp", "()V", deep_jlet_pause, Default::default())],
+                        methods: vec![JavaMethodProto::new("pauseApp", "()V", deep_jlet_pause, MethodAccessFlags::PROTECTED)],
                         fields: vec![],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -652,11 +696,11 @@ mod tests {
                         interfaces: vec![],
                         methods: vec![],
                         fields: vec![
-                            JavaFieldProto::new("word", "I", FieldAccessFlags::STATIC),
-                            JavaFieldProto::new("wide", "J", FieldAccessFlags::STATIC),
-                            JavaFieldProto::new("reference", "Ljava/lang/String;", FieldAccessFlags::STATIC),
+                            JavaFieldProto::new("word", "I", FieldAccessFlags::PRIVATE | FieldAccessFlags::STATIC),
+                            JavaFieldProto::new("wide", "J", FieldAccessFlags::PRIVATE | FieldAccessFlags::STATIC),
+                            JavaFieldProto::new("reference", "Ljava/lang/String;", FieldAccessFlags::PRIVATE | FieldAccessFlags::STATIC),
                         ],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -686,7 +730,7 @@ mod tests {
 
             let class_object: u32 = core.run_function(descriptor.fn_get_class, &[]).await?;
             assert_eq!(class_object, java_class_raw);
-            assert_eq!(static_fields, static_definition.ptr_raw + size_of::<RawJavaClass>() as u32);
+            assert_eq!(static_fields, java_class_instance.ptr_fields()? + 0x14);
             assert_eq!(read_generic::<u32, _>(&core, static_fields)?, 0x1234_5678);
             assert_eq!(read_generic::<u32, _>(&core, static_fields + 4)?, 0x9abc_def0);
             assert_eq!(read_generic::<u32, _>(&core, static_fields + 8)?, 0x1234_5678);
@@ -710,7 +754,7 @@ mod tests {
 
             let initialized_class_object: u32 = core.run_function(descriptor.fn_get_initialized_class, &[]).await?;
             assert_eq!(initialized_class_object, class_object);
-            assert_eq!(java_class_instance.ptr_fields()?, class_fields);
+            assert_ne!(java_class_instance.ptr_fields()?, class_fields);
             let native_name: i32 = jvm.get_field(&java_class, CLASS_NATIVE_NAME_FIELD, WORD_FIELD_DESCRIPTOR).await.unwrap();
             let initialization_state: i32 = jvm
                 .get_field(&java_class, CLASS_INITIALIZATION_STATE_FIELD, WORD_FIELD_DESCRIPTOR)
@@ -747,8 +791,8 @@ mod tests {
                         parent_class: Some("net/wie/test/StaticStorage"),
                         interfaces: vec![],
                         methods: vec![],
-                        fields: vec![JavaFieldProto::new("word", "I", FieldAccessFlags::STATIC)],
-                        access_flags: Default::default(),
+                        fields: vec![JavaFieldProto::new("word", "I", FieldAccessFlags::PRIVATE | FieldAccessFlags::STATIC)],
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -761,6 +805,22 @@ mod tests {
                 .unwrap();
             let JavaValue::Object(Some(inherited_reference)) = static_child_definition.get_static_field(&*reference_field).unwrap() else {
                 panic!("expected inherited static reference field")
+            };
+            assert_eq!(inherited_reference.identity(), guest_reference.identity());
+
+            write_generic(&mut core, static_fields, guest_reference_raw)?;
+            static_child_definition.put_static_field(&*child_word_field, JavaValue::Int(4)).unwrap();
+            let static_reference_field = ClassDefinition::fields(&static_definition)
+                .into_iter()
+                .find(|field| {
+                    field
+                        .as_any()
+                        .downcast_ref::<super::JavaStaticReferenceField>()
+                        .is_some_and(|field| field.word_index == 0)
+                })
+                .unwrap();
+            let JavaValue::Object(Some(inherited_reference)) = static_child_definition.get_static_field(&*static_reference_field).unwrap() else {
+                panic!("expected inherited untyped static reference")
             };
             assert_eq!(inherited_reference.identity(), guest_reference.identity());
 
@@ -786,14 +846,14 @@ mod tests {
                         interfaces: vec![],
                         methods: vec![],
                         fields: vec![
-                            JavaFieldProto::new("f0", "I", Default::default()),
-                            JavaFieldProto::new("f1", "I", Default::default()),
-                            JavaFieldProto::new("f2", "I", Default::default()),
-                            JavaFieldProto::new("f3", "I", Default::default()),
-                            JavaFieldProto::new("f4", "I", Default::default()),
-                            JavaFieldProto::new("f5", "I", Default::default()),
+                            JavaFieldProto::new("f0", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("f1", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("f2", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("f3", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("f4", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("f5", "I", FieldAccessFlags::PRIVATE),
                         ],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -809,11 +869,11 @@ mod tests {
                         interfaces: vec![],
                         methods: vec![],
                         fields: vec![
-                            JavaFieldProto::new("own0", "I", Default::default()),
-                            JavaFieldProto::new("own1", "I", Default::default()),
-                            JavaFieldProto::new("static0", "I", FieldAccessFlags::STATIC),
+                            JavaFieldProto::new("own0", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("own1", "I", FieldAccessFlags::PRIVATE),
+                            JavaFieldProto::new("static0", "I", FieldAccessFlags::PRIVATE | FieldAccessFlags::STATIC),
                         ],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
@@ -873,24 +933,36 @@ mod tests {
                         parent_class: Some("org/kwis/msp/lcdui/JletWrapper"),
                         interfaces: vec![],
                         methods: vec![
-                            JavaMethodProto::new("startApp", "([Ljava/lang/String;)V", jlet_start, Default::default()),
-                            JavaMethodProto::new("pauseApp", "()V", jlet_pause, Default::default()),
-                            JavaMethodProto::new("resumeApp", "()V", jlet_resume, Default::default()),
-                            JavaMethodProto::new("destroyApp", "(Z)V", jlet_destroy, Default::default()),
+                            JavaMethodProto::new("startApp", "([Ljava/lang/String;)V", jlet_start, MethodAccessFlags::PROTECTED),
+                            JavaMethodProto::new("pauseApp", "()V", jlet_pause, MethodAccessFlags::PROTECTED),
+                            JavaMethodProto::new("resumeApp", "()V", jlet_resume, MethodAccessFlags::PROTECTED),
+                            JavaMethodProto::new("destroyApp", "(Z)V", jlet_destroy, MethodAccessFlags::PROTECTED),
                         ],
                         fields: vec![],
-                        access_flags: Default::default(),
+                        access_flags: ClassAccessFlags::PUBLIC,
                     },
                     Box::new(()),
                 )
                 .await
                 .unwrap();
-            let ptr_entry = generated_entry.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap().ptr_raw;
+            let generated_definition = generated_entry.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            let ptr_entry = generated_definition.ptr_raw;
+            let ptr_parent_name = Allocator::alloc(&mut core, "org/kwis/msp/lcdui/JletWrapper".len() as u32 + 1)?;
+            write_null_terminated_string_bytes(&mut core, ptr_parent_name, b"org/kwis/msp/lcdui/JletWrapper")?;
+            let raw_class: RawJavaClass = read_generic(&core, ptr_entry)?;
+            let mut descriptor: RawJavaClassDescriptor = read_generic(&core, raw_class.ptr_descriptor)?;
+            descriptor.ptr_super_class = ptr_parent_name;
+            descriptor.flags |= LGT_JAVA_CLASS_SUPER_CLASS_IS_NAME;
+            write_generic(&mut core, raw_class.ptr_descriptor, descriptor)?;
+
             let loader: Box<dyn ClassInstance> = jvm
                 .invoke_static("java/lang/ClassLoader", "getSystemClassLoader", "()Ljava/lang/ClassLoader;", ())
                 .await
                 .unwrap();
-            LgtJvmSupport::register_generated_class(&mut core, &jvm, ptr_entry, loader).await?;
+            let generated_classes = Allocator::alloc(&mut core, 2 * size_of::<u32>() as u32)?;
+            write_generic(&mut core, generated_classes, 0u32)?;
+            write_generic(&mut core, generated_classes + size_of::<u32>() as u32, ptr_entry)?;
+            LgtJvmSupport::register_generated_class(&mut core, &jvm, ptr_entry, generated_classes, loader).await?;
 
             let definition = jvm
                 .get_class("net/wie/test/GeneratedJletEntry")
@@ -900,6 +972,12 @@ mod tests {
                 .downcast_ref::<super::JavaClassDefinition>()
                 .unwrap()
                 .clone();
+            let descriptor = definition.descriptor()?;
+            let parent_class = jvm.get_class("org/kwis/msp/lcdui/JletWrapper").unwrap();
+            let parent = parent_class.definition.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            assert_eq!(descriptor.ptr_super_class, parent.ptr_raw);
+            assert_eq!(descriptor.flags & LGT_JAVA_CLASS_SUPER_CLASS_IS_NAME, 0);
+
             let methods = definition.vtable_entries(&jvm).await?;
             for (index, name, descriptor) in [
                 (15usize, "startApp", "([Ljava/lang/String;)V"),
@@ -914,6 +992,146 @@ mod tests {
                     method.target()?
                 );
             }
+
+            done_clone.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+
+        while !done.load(Ordering::Relaxed) {
+            system.tick()?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_class_exposes_compiler_vtable_methods_to_jvm() -> Result<()> {
+        let mut system = System::new(Box::new(TestPlatform::new()), "", "", DefaultTaskRunner);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        let system_clone = system.clone();
+
+        system.spawn(async move || {
+            let (jvm, mut core, implementation) = init_jvm(&system_clone).await?;
+            let generated_class = implementation
+                .define_class_rust(
+                    &jvm,
+                    JavaClassProto {
+                        name: "net/wie/test/GeneratedInputStream",
+                        parent_class: Some("java/io/InputStream"),
+                        interfaces: vec![],
+                        methods: vec![JavaMethodProto::new("read", "()I", base_value, MethodAccessFlags::PUBLIC)],
+                        fields: vec![],
+                        access_flags: ClassAccessFlags::PUBLIC,
+                    },
+                    Box::new(()),
+                )
+                .await
+                .unwrap();
+            let generated_definition = generated_class.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            let raw_class: RawJavaClass = read_generic(&core, generated_definition.ptr_raw)?;
+            let mut descriptor: RawJavaClassDescriptor = read_generic(&core, raw_class.ptr_descriptor)?;
+            let parent_name = "java/io/InputStream";
+            let ptr_parent_name = Allocator::alloc(&mut core, parent_name.len() as u32 + 1)?;
+            write_null_terminated_string_bytes(&mut core, ptr_parent_name, parent_name.as_bytes())?;
+            descriptor.ptr_super_class = ptr_parent_name;
+            descriptor.flags |= LGT_JAVA_CLASS_SUPER_CLASS_IS_NAME;
+            descriptor.ptr_vtable = raw_class.unk1;
+            descriptor.ptr_methods = 0;
+            write_generic(&mut core, raw_class.ptr_descriptor, descriptor)?;
+
+            let loader: Box<dyn ClassInstance> = jvm
+                .invoke_static("java/lang/ClassLoader", "getSystemClassLoader", "()Ljava/lang/ClassLoader;", ())
+                .await
+                .unwrap();
+            let generated_classes = Allocator::alloc(&mut core, 2 * size_of::<u32>() as u32)?;
+            write_generic(&mut core, generated_classes, 0u32)?;
+            write_generic(&mut core, generated_classes + size_of::<u32>() as u32, generated_definition.ptr_raw)?;
+            LgtJvmSupport::register_generated_class(&mut core, &jvm, generated_definition.ptr_raw, generated_classes, loader).await?;
+
+            let linked_class = jvm.get_class("net/wie/test/GeneratedInputStream").unwrap();
+            let linked_definition = linked_class.definition.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            assert_ne!(linked_definition.descriptor()?.ptr_methods, 0);
+            let instance = jvm.instantiate_class("net/wie/test/GeneratedInputStream").await.unwrap();
+            let value: i32 = jvm.invoke_virtual(&instance, "java/io/InputStream", "read", "()I", ()).await.unwrap();
+            assert_eq!(value, 1);
+
+            let generated_class = implementation
+                .define_class_rust(
+                    &jvm,
+                    JavaClassProto {
+                        name: "net/wie/test/GeneratedRunnable",
+                        parent_class: Some("java/lang/Object"),
+                        interfaces: vec!["java/lang/Runnable"],
+                        methods: vec![JavaMethodProto::new("run", "()V", jlet_pause, MethodAccessFlags::PUBLIC)],
+                        fields: vec![],
+                        access_flags: ClassAccessFlags::PUBLIC,
+                    },
+                    Box::new(()),
+                )
+                .await
+                .unwrap();
+            let generated_definition = generated_class.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            let raw_class: RawJavaClass = read_generic(&core, generated_definition.ptr_raw)?;
+            let mut descriptor: RawJavaClassDescriptor = read_generic(&core, raw_class.ptr_descriptor)?;
+            let method: RawJavaMethod = read_generic(&core, descriptor.ptr_methods + size_of::<u32>() as u32)?;
+            let ptr_vtable = Allocator::alloc(&mut core, 12 * size_of::<u32>() as u32)?;
+            let mut inherited_vtable = vec![0; 11 * size_of::<u32>()];
+            core.read_bytes(raw_class.unk1, &mut inherited_vtable)?;
+            core.write_bytes(ptr_vtable, &inherited_vtable)?;
+            write_generic(&mut core, ptr_vtable + 11 * size_of::<u32>() as u32, method.ptr_method)?;
+
+            let interface_name = "java/lang/Runnable";
+            let ptr_interface_name = Allocator::alloc(&mut core, interface_name.len() as u32 + 1)?;
+            write_null_terminated_string_bytes(&mut core, ptr_interface_name, interface_name.as_bytes())?;
+            let ptr_interface_reference = Allocator::alloc(&mut core, size_of::<RawJavaInterfaceReference>() as u32)?;
+            write_generic(
+                &mut core,
+                ptr_interface_reference,
+                RawJavaInterfaceReference {
+                    ptr_class_or_name: ptr_interface_name,
+                },
+            )?;
+            let ptr_interface_references = Allocator::alloc(&mut core, (size_of::<RawJavaInterfaceReferences>() + size_of::<u32>()) as u32)?;
+            write_generic(
+                &mut core,
+                ptr_interface_references,
+                RawJavaInterfaceReferences { count: 1, references: [] },
+            )?;
+            write_generic(
+                &mut core,
+                ptr_interface_references + size_of::<RawJavaInterfaceReferences>() as u32,
+                ptr_interface_reference,
+            )?;
+
+            descriptor.ptr_vtable = ptr_vtable;
+            descriptor.vtable_count = 11;
+            descriptor.ptr_interface_references = ptr_interface_references;
+            descriptor.ptr_interface_names = 0;
+            descriptor.ptr_methods = 0;
+            write_generic(&mut core, raw_class.ptr_descriptor, descriptor)?;
+
+            let loader: Box<dyn ClassInstance> = jvm
+                .invoke_static("java/lang/ClassLoader", "getSystemClassLoader", "()Ljava/lang/ClassLoader;", ())
+                .await
+                .unwrap();
+            write_generic(&mut core, generated_classes + size_of::<u32>() as u32, generated_definition.ptr_raw)?;
+            LgtJvmSupport::register_generated_class(&mut core, &jvm, generated_definition.ptr_raw, generated_classes, loader).await?;
+
+            let linked_class = jvm.get_class("net/wie/test/GeneratedRunnable").unwrap();
+            let linked_definition = linked_class.definition.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            assert_eq!(
+                ClassDefinition::interface_names(linked_definition),
+                vec![RustString::from(interface_name)]
+            );
+            let reference: RawJavaInterfaceReference = read_generic(&core, ptr_interface_reference)?;
+            let runnable = jvm.get_class(interface_name).unwrap();
+            let runnable_definition = runnable.definition.as_any().downcast_ref::<super::JavaClassDefinition>().unwrap();
+            assert_eq!(reference.ptr_class_or_name, runnable_definition.ptr_raw);
+            let instance = jvm.instantiate_class("net/wie/test/GeneratedRunnable").await.unwrap();
+            jvm.invoke_virtual::<_, ()>(&instance, "java/lang/Runnable", "run", "()V", ())
+                .await
+                .unwrap();
 
             done_clone.store(true, Ordering::Relaxed);
             Ok(())

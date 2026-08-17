@@ -17,8 +17,6 @@ pub struct SMSMessage;
 
 impl SMSMessage {
     pub fn as_proto() -> WieJavaClassProto {
-        let public_static_final = FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL;
-
         WieJavaClassProto {
             name: "com/skt/m/SMSMessage",
             parent_class: Some("java/lang/Object"),
@@ -50,10 +48,26 @@ impl SMSMessage {
                 JavaMethodProto::new("getURL", "()Ljava/lang/String;", Self::get_url, MethodAccessFlags::PUBLIC),
             ],
             fields: vec![
-                JavaFieldProto::new("APPLICATION_DATA", "I", public_static_final),
-                JavaFieldProto::new("DOWNLOAD_NOTIFICATION", "I", public_static_final),
-                JavaFieldProto::new("SHORT_MESSAGE", "I", public_static_final),
-                JavaFieldProto::new("UNKNOWN", "I", public_static_final),
+                JavaFieldProto::new(
+                    "APPLICATION_DATA",
+                    "I",
+                    FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
+                ),
+                JavaFieldProto::new(
+                    "DOWNLOAD_NOTIFICATION",
+                    "I",
+                    FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
+                ),
+                JavaFieldProto::new(
+                    "SHORT_MESSAGE",
+                    "I",
+                    FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
+                ),
+                JavaFieldProto::new(
+                    "UNKNOWN",
+                    "I",
+                    FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
+                ),
                 JavaFieldProto::new("type", "I", FieldAccessFlags::PRIVATE),
                 JavaFieldProto::new("shortMessage", "[B", FieldAccessFlags::PRIVATE),
                 JavaFieldProto::new("sender", "Ljava/lang/String;", FieldAccessFlags::PRIVATE),
@@ -196,7 +210,7 @@ mod test {
             |jvm| async move {
                 let unknown: i32 = jvm.get_static_field("com/skt/m/SMSMessage", "UNKNOWN", "I").await?;
                 let default_message: ClassInstanceRef<SMSMessage> = jvm.new_class("com/skt/m/SMSMessage", "()V", ()).await?.into();
-                let default_type: i32 = jvm.invoke_virtual(&default_message, "getType", "()I", ()).await?;
+                let default_type: i32 = jvm.invoke_virtual(&default_message, "com/skt/m/SMSMessage", "getType", "()I", ()).await?;
                 assert_eq!(default_type, unknown);
 
                 let mut short_data = jvm.instantiate_array("B", 3).await?;
@@ -206,10 +220,14 @@ mod test {
                     .new_class("com/skt/m/SMSMessage", "([BLjava/lang/String;)V", (short_data.clone(), sender.clone()))
                     .await?
                     .into();
-                let short_type: i32 = jvm.invoke_virtual(&short_message, "getType", "()I", ()).await?;
+                let short_type: i32 = jvm.invoke_virtual(&short_message, "com/skt/m/SMSMessage", "getType", "()I", ()).await?;
                 let expected_short_type: i32 = jvm.get_static_field("com/skt/m/SMSMessage", "SHORT_MESSAGE", "I").await?;
-                let returned_short_data: ClassInstanceRef<Array<i8>> = jvm.invoke_virtual(&short_message, "getShortMessage", "()[B", ()).await?;
-                let returned_sender: ClassInstanceRef<String> = jvm.invoke_virtual(&short_message, "getSender", "()Ljava/lang/String;", ()).await?;
+                let returned_short_data: ClassInstanceRef<Array<i8>> = jvm
+                    .invoke_virtual(&short_message, "com/skt/m/SMSMessage", "getShortMessage", "()[B", ())
+                    .await?;
+                let returned_sender: ClassInstanceRef<String> = jvm
+                    .invoke_virtual(&short_message, "com/skt/m/SMSMessage", "getSender", "()Ljava/lang/String;", ())
+                    .await?;
                 assert_eq!(short_type, expected_short_type);
                 assert_eq!(
                     returned_short_data.instance.as_ref().map(|instance| instance.identity()),
@@ -225,10 +243,13 @@ mod test {
                     .new_class("com/skt/m/SMSMessage", "(Ljava/lang/String;[B)V", (cname.clone(), app_data.clone()))
                     .await?
                     .into();
-                let app_type: i32 = jvm.invoke_virtual(&app_message, "getType", "()I", ()).await?;
+                let app_type: i32 = jvm.invoke_virtual(&app_message, "com/skt/m/SMSMessage", "getType", "()I", ()).await?;
                 let expected_app_type: i32 = jvm.get_static_field("com/skt/m/SMSMessage", "APPLICATION_DATA", "I").await?;
-                let returned_cname: ClassInstanceRef<String> = jvm.invoke_virtual(&app_message, "getCName", "()Ljava/lang/String;", ()).await?;
-                let returned_app_data: ClassInstanceRef<Array<i8>> = jvm.invoke_virtual(&app_message, "getAppData", "()[B", ()).await?;
+                let returned_cname: ClassInstanceRef<String> = jvm
+                    .invoke_virtual(&app_message, "com/skt/m/SMSMessage", "getCName", "()Ljava/lang/String;", ())
+                    .await?;
+                let returned_app_data: ClassInstanceRef<Array<i8>> =
+                    jvm.invoke_virtual(&app_message, "com/skt/m/SMSMessage", "getAppData", "()[B", ()).await?;
                 assert_eq!(app_type, expected_app_type);
                 assert_eq!(JavaLangString::to_rust_string(&jvm, &returned_cname).await?, "weather");
                 assert_eq!(jvm.load_array::<i8>(&returned_app_data, 0, 2).await?, [10i8, 20]);
@@ -244,18 +265,27 @@ mod test {
                     )
                     .await?
                     .into();
-                let download_type: i32 = jvm.invoke_virtual(&download_message, "getType", "()I", ()).await?;
+                let download_type: i32 = jvm
+                    .invoke_virtual(&download_message, "com/skt/m/SMSMessage", "getType", "()I", ())
+                    .await?;
                 let expected_download_type: i32 = jvm.get_static_field("com/skt/m/SMSMessage", "DOWNLOAD_NOTIFICATION", "I").await?;
-                let returned_url: ClassInstanceRef<String> = jvm.invoke_virtual(&download_message, "getURL", "()Ljava/lang/String;", ()).await?;
-                let returned_name: ClassInstanceRef<String> = jvm.invoke_virtual(&download_message, "getName", "()Ljava/lang/String;", ()).await?;
-                let returned_comment: ClassInstanceRef<String> =
-                    jvm.invoke_virtual(&download_message, "getComment", "()Ljava/lang/String;", ()).await?;
+                let returned_url: ClassInstanceRef<String> = jvm
+                    .invoke_virtual(&download_message, "com/skt/m/SMSMessage", "getURL", "()Ljava/lang/String;", ())
+                    .await?;
+                let returned_name: ClassInstanceRef<String> = jvm
+                    .invoke_virtual(&download_message, "com/skt/m/SMSMessage", "getName", "()Ljava/lang/String;", ())
+                    .await?;
+                let returned_comment: ClassInstanceRef<String> = jvm
+                    .invoke_virtual(&download_message, "com/skt/m/SMSMessage", "getComment", "()Ljava/lang/String;", ())
+                    .await?;
                 assert_eq!(download_type, expected_download_type);
                 assert_eq!(JavaLangString::to_rust_string(&jvm, &returned_url).await?, "https://example.invalid/app");
                 assert_eq!(JavaLangString::to_rust_string(&jvm, &returned_name).await?, "Example");
                 assert_eq!(JavaLangString::to_rust_string(&jvm, &returned_comment).await?, "Install");
 
-                let service_option: i8 = jvm.invoke_virtual(&download_message, "getServiceOption", "()B", ()).await?;
+                let service_option: i8 = jvm
+                    .invoke_virtual(&download_message, "com/skt/m/SMSMessage", "getServiceOption", "()B", ())
+                    .await?;
                 assert_eq!(service_option, 0);
 
                 Ok(())

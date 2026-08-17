@@ -1,6 +1,7 @@
 use alloc::vec;
 
 use java_class_proto::{JavaFieldProto, JavaMethodProto};
+use java_constants::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
 use jvm::{Array, ClassInstanceRef, Jvm, Result as JvmResult, runtime::JavaLangString};
 
 use wie_jvm_support::{WieJavaClassProto, WieJvmContext};
@@ -17,13 +18,18 @@ impl BaseClip {
             parent_class: Some("java/lang/Object"),
             interfaces: vec![],
             methods: vec![
-                JavaMethodProto::new("<init>", "()V", Self::init, Default::default()),
-                JavaMethodProto::new("putData", "([BII)I", Self::put_data, Default::default()),
-                JavaMethodProto::new("clearData", "()V", Self::clear_data, Default::default()),
-                JavaMethodProto::new("availableDataSize", "()I", Self::available_data_size, Default::default()),
+                JavaMethodProto::new("<init>", "()V", Self::init, MethodAccessFlags::PUBLIC),
+                JavaMethodProto::new("putData", "([BII)I", Self::put_data, MethodAccessFlags::PUBLIC),
+                JavaMethodProto::new("setBuffer", "([BI)Z", Self::set_buffer, MethodAccessFlags::PUBLIC),
+                JavaMethodProto::new("clearData", "()V", Self::clear_data, MethodAccessFlags::PUBLIC),
+                JavaMethodProto::new("availableDataSize", "()I", Self::available_data_size, MethodAccessFlags::PUBLIC),
             ],
-            fields: vec![JavaFieldProto::new("player", "Ljavax/microedition/media/Player;", Default::default())],
-            access_flags: Default::default(),
+            fields: vec![JavaFieldProto::new(
+                "player",
+                "Ljavax/microedition/media/Player;",
+                FieldAccessFlags::PRIVATE,
+            )],
+            access_flags: ClassAccessFlags::PUBLIC,
         }
     }
 
@@ -76,10 +82,26 @@ impl BaseClip {
             return Ok(());
         }
 
-        let _: () = jvm.invoke_virtual(&player, "close", "()V", ()).await?;
+        let _: () = jvm.invoke_virtual(&player, "javax/microedition/media/Player", "close", "()V", ()).await?;
 
         jvm.put_field(&mut this, "player", "Ljavax/microedition/media/Player;", None).await?;
 
         Ok(())
+    }
+
+    async fn set_buffer(
+        jvm: &Jvm,
+        _: &mut WieJvmContext,
+        this: ClassInstanceRef<Self>,
+        buffer: ClassInstanceRef<Array<i8>>,
+        size: i32,
+    ) -> JvmResult<bool> {
+        tracing::debug!("org.kwis.msp.media.BaseClip::setBuffer({this:?}, {buffer:?}, {size})");
+
+        let written: i32 = jvm
+            .invoke_virtual(&this, "org/kwis/msp/media/BaseClip", "putData", "([BII)I", (buffer, 0, size))
+            .await?;
+
+        Ok(written == size)
     }
 }

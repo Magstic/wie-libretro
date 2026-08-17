@@ -50,14 +50,17 @@ pub enum JavaSystemSvcId {
     StoreReferenceArrayUnchecked = 21,
     InstantiateMultiArray = 22,
     LinkPublicClass = 23,
-    ExceptionMatchesClass = 24,
-    RethrowException = 25,
+    IsClassAssignable = 24,
+    ThrowException = 25,
     RaiseNullPointerException = 26,
     RaiseArrayIndexException = 27,
     RaiseArithmeticException = 28,
     Unk1 = 29,
     Unk2 = 30,
     Unk3 = 31,
+    GetInterfaceDispatchTable = 32,
+    MonitorEnter = 33,
+    MonitorExit = 34,
 }
 
 impl TryFrom<SvcId> for JavaSystemSvcId {
@@ -89,14 +92,17 @@ impl TryFrom<SvcId> for JavaSystemSvcId {
             21 => Self::StoreReferenceArrayUnchecked,
             22 => Self::InstantiateMultiArray,
             23 => Self::LinkPublicClass,
-            24 => Self::ExceptionMatchesClass,
-            25 => Self::RethrowException,
+            24 => Self::IsClassAssignable,
+            25 => Self::ThrowException,
             26 => Self::RaiseNullPointerException,
             27 => Self::RaiseArrayIndexException,
             28 => Self::RaiseArithmeticException,
             29 => Self::Unk1,
             30 => Self::Unk2,
             31 => Self::Unk3,
+            32 => Self::GetInterfaceDispatchTable,
+            33 => Self::MonitorEnter,
+            34 => Self::MonitorExit,
             _ => {
                 return Err(wie_util::WieError::FatalError(alloc::format!(
                     "Unknown LGT Java system SVC id {}",
@@ -133,6 +139,7 @@ pub enum WIPICSvcId {
     Unk13 = 0x68,
     Unk1 = 0x6a,
     Exit = 0x6b,
+    GetProgramName = 0x6f,
     Alloc = 0x75,
     Calloc = 0x76,
     Free = 0x77,
@@ -219,6 +226,7 @@ pub enum WIPICSvcId {
     SetMuteState = 0x4d1,
     GetMuteState = 0x4d2,
     BackLight = 0x578,
+    Unk16 = 0x581,
 }
 
 impl TryFrom<SvcId> for WIPICSvcId {
@@ -237,6 +245,7 @@ impl TryFrom<SvcId> for WIPICSvcId {
             0x68 => Self::Unk13,
             0x6a => Self::Unk1,
             0x6b => Self::Exit,
+            0x6f => Self::GetProgramName,
             0x75 => Self::Alloc,
             0x76 => Self::Calloc,
             0x77 => Self::Free,
@@ -323,6 +332,7 @@ impl TryFrom<SvcId> for WIPICSvcId {
             0x4d1 => Self::SetMuteState,
             0x4d2 => Self::GetMuteState,
             0x578 => Self::BackLight,
+            0x581 => Self::Unk16,
             _ => return Err(wie_util::WieError::FatalError(alloc::format!("Unknown LGT WIPIC SVC id {}", value.0))),
         })
     }

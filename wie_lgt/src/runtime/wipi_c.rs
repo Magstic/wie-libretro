@@ -56,6 +56,7 @@ async fn handle_wipic_svc(core: &mut ArmCore, (system, jvm): &mut (System, Jvm),
         WIPICSvcId::Unk13 => unk13.into_body(),
         WIPICSvcId::Unk1 => unk1.into_body(),
         WIPICSvcId::Exit => kernel::exit.into_body(),
+        WIPICSvcId::GetProgramName => kernel::get_program_name.into_body(),
         WIPICSvcId::Alloc => kernel::alloc.into_body(),
         WIPICSvcId::Calloc => kernel::calloc.into_body(),
         WIPICSvcId::Free => kernel::free.into_body(),
@@ -142,6 +143,7 @@ async fn handle_wipic_svc(core: &mut ArmCore, (system, jvm): &mut (System, Jvm),
         WIPICSvcId::SetMuteState => media::set_mute_state.into_body(),
         WIPICSvcId::GetMuteState => media::get_mute_state.into_body(),
         WIPICSvcId::BackLight => misc::back_light.into_body(),
+        WIPICSvcId::Unk16 => unk16.into_body(),
     };
 
     EmulatedFunction::call(
@@ -430,6 +432,14 @@ async fn unk15(_context: &mut dyn WIPICContext, a0: u32, a1: u32, a2: u32, a3: u
     tracing::warn!("stub unk15({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x})");
 
     // media
+
+    Ok(0)
+}
+
+async fn unk16(_context: &mut dyn WIPICContext, a0: u32, a1: u32, a2: u32, a3: u32) -> Result<u32> {
+    tracing::warn!("stub unk16({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x})");
+
+    // misc
 
     Ok(0)
 }

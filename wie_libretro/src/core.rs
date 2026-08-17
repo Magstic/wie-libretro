@@ -14,7 +14,7 @@ use wie_backend::{Emulator, Event, Platform};
 use wie_util::{Result, WieError};
 
 use crate::{
-    audio::{AUDIO_FPS, AUDIO_SAMPLE_RATE, AudioState, MidiOutput},
+    audio::{AUDIO_FPS, AUDIO_SAMPLE_RATE, AudioState, AudioWorker, MidiOutput},
     content::{LoadedContent, load_emulator},
     environment::{CoreOptions, core_options_updated, read_core_options},
     ffi::{
@@ -61,6 +61,7 @@ pub struct RunCallbacks {
 
 pub struct LibretroCore {
     shared: Arc<Shared>,
+    audio_worker: AudioWorker,
     tx: Sender<WorkerMsg>,
     worker: Option<JoinHandle<()>>,
     input: InputManager,
@@ -85,12 +86,15 @@ impl LibretroCore {
             options.sound_font_path.clone(),
             options.midi_volume,
         ));
+        let (audio_worker, audio_tx) = AudioWorker::new(audio.clone(), midi.clone())
+            .map_err(|err| WieError::FatalError(format!("Failed to start libretro audio worker thread: {err}")))?;
         let shared = Arc::new(Shared::new(options.width, options.height, audio, midi));
         let platform: Box<dyn Platform> = Box::new(crate::platform::LibretroPlatform::new(
             options.width,
             options.height,
             save_dir,
             shared.clone(),
+            audio_tx,
             callbacks.log,
         ));
         wie_core_arm::set_hooks_enabled(options.hooks_enabled);
@@ -122,6 +126,7 @@ impl LibretroCore {
         let video_frame = Frame::new(options.width, options.height);
         Ok(Self {
             shared,
+            audio_worker,
             tx,
             worker: Some(worker),
             input: InputManager::new(),
@@ -163,10 +168,6 @@ impl LibretroCore {
 
     pub fn shutdown(&mut self) {
         self.stop_rumble();
-        self.shared.midi.shutdown();
-        if let Ok(mut audio) = self.shared.audio.lock() {
-            audio.clear();
-        }
         self.shared.quit.store(true, Release);
 
         if let Some(worker) = self.worker.take()
@@ -175,6 +176,8 @@ impl LibretroCore {
         {
             *fatal = Some("emulator worker panicked during shutdown".to_owned());
         }
+        self.audio_worker.shutdown();
+        self.shared.midi.shutdown();
         if let Ok(mut audio) = self.shared.audio.lock() {
             audio.clear();
         }
@@ -397,7 +400,7 @@ mod tests {
     use std::time::Instant;
 
     use crate::{
-        audio::{AudioState, MidiOutput},
+        audio::{AudioState, AudioWorker, MidiOutput},
         content::LoadedContent,
         environment::CoreOptions,
         ffi::{RETRO_ENVIRONMENT_SHUTDOWN, RetroEnvironmentT, RetroVideoRefreshT},
@@ -411,22 +414,27 @@ mod tests {
     static VIDEO_CALLBACK_FRAMEBUFFER_UNLOCKED: AtomicUsize = AtomicUsize::new(0);
     static VIDEO_TEST_SHARED: Mutex<Option<Arc<crate::shared::Shared>>> = Mutex::new(None);
 
+    fn test_shared(options: &CoreOptions) -> (Arc<crate::shared::Shared>, AudioWorker) {
+        let audio = Arc::new(Mutex::new(AudioState::new(crate::audio::AUDIO_SAMPLE_RATE)));
+        let midi = Arc::new(MidiOutput::new(false, None, 5));
+        let (audio_worker, _) = AudioWorker::new(audio.clone(), midi.clone()).unwrap();
+        let shared = Arc::new(crate::shared::Shared::new(options.width, options.height, audio, midi));
+
+        (shared, audio_worker)
+    }
+
     #[test]
     fn quit_state_does_not_request_frontend_shutdown() {
         SHUTDOWN_REQUESTS.store(0, Ordering::SeqCst);
 
         let (tx, _rx) = mpsc::channel();
         let options = CoreOptions::default();
-        let shared = Arc::new(crate::shared::Shared::new(
-            options.width,
-            options.height,
-            Arc::new(Mutex::new(AudioState::new(crate::audio::AUDIO_SAMPLE_RATE))),
-            Arc::new(MidiOutput::new(false, None, 5)),
-        ));
+        let (shared, audio_worker) = test_shared(&options);
         shared.quit.store(true, Ordering::Release);
 
         let mut core = LibretroCore {
             shared,
+            audio_worker,
             tx,
             worker: None,
             input: crate::input::InputManager::new(),
@@ -459,16 +467,12 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel();
         let options = CoreOptions::default();
-        let shared = Arc::new(crate::shared::Shared::new(
-            options.width,
-            options.height,
-            Arc::new(Mutex::new(AudioState::new(crate::audio::AUDIO_SAMPLE_RATE))),
-            Arc::new(MidiOutput::new(false, None, 5)),
-        ));
+        let (shared, audio_worker) = test_shared(&options);
         *VIDEO_TEST_SHARED.lock().unwrap() = Some(shared.clone());
 
         let mut core = LibretroCore {
             shared,
+            audio_worker,
             tx,
             worker: None,
             input: crate::input::InputManager::new(),
@@ -494,16 +498,12 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel();
         let options = CoreOptions::default();
-        let shared = Arc::new(crate::shared::Shared::new(
-            options.width,
-            options.height,
-            Arc::new(Mutex::new(AudioState::new(crate::audio::AUDIO_SAMPLE_RATE))),
-            Arc::new(MidiOutput::new(false, None, 5)),
-        ));
+        let (shared, audio_worker) = test_shared(&options);
         *shared.rumble.lock().unwrap() = Some((1000, 50));
 
         let mut core = LibretroCore {
             shared,
+            audio_worker,
             tx,
             worker: None,
             input: crate::input::InputManager::new(),

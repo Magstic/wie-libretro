@@ -20,9 +20,7 @@ use self::{framebuffer::FrameBuffer, grp_context::WIPICGraphicsContextIdx, image
 
 const FRAMEBUFFER_DEPTH: u32 = 16; // XXX hardcode to 16bpp as some game requires 16bpp framebuffer
 const SCREEN_FRAMEBUFFER_PTR: u32 = 0x7fff1000;
-/// Read a WIPI-C string. `length == -1` means NUL-terminated; `length > 0`
-/// reads exactly that many bytes; `length == 0` and other negatives yield
-/// an empty string.
+
 fn read_wipi_string(context: &mut dyn WIPICContext, ptr: WIPICWord, length: i32) -> Result<Vec<u8>> {
     if length > 0 {
         let mut buf = vec![0u8; length as usize];
@@ -514,16 +512,15 @@ pub async fn draw_string(
 ) -> Result<()> {
     tracing::debug!("MC_grpDrawString({:#x}, {x}, {y}, {ptr_string:#x}, {length}, {pgc:#x})", dst.0);
 
-    let string_bytes = read_wipi_string(context, ptr_string, length)?;
-    if string_bytes.is_empty() {
+    let bytes = read_wipi_string(context, ptr_string, length)?;
+    if bytes.is_empty() {
         return Ok(());
     }
 
+    let s = encoding_rs::EUC_KR.decode(&bytes).0;
+
     let framebuffer = FrameBuffer(read_generic(context, context.data_ptr(dst)?)?);
     let gctx: WIPICGraphicsContext = read_generic(context, pgc)?;
-
-    let string = encoding_rs::EUC_KR.decode(&string_bytes).0;
-
     let clip = Clip {
         x: 0,
         y: 0,
@@ -533,7 +530,7 @@ pub async fn draw_string(
 
     let mut canvas = framebuffer.canvas(context)?;
     let color = framebuffer.pixel_to_color(gctx.fgpxl);
-    canvas.draw_text(&string, x, y, TextAlignment::Left, color, clip);
+    canvas.draw_text(&s, x, y, TextAlignment::Left, color, clip);
     canvas.flush()?;
 
     Ok(())

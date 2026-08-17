@@ -1,10 +1,18 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
-use std::{fs, path::PathBuf};
 
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
+use wie_backend::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, TimedAudioEvent};
 
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const AUDIO_FPS: f64 = 60.0;
@@ -105,29 +113,12 @@ impl MidiOutput {
         }
     }
 
-    pub fn note_on(&self, channel: u8, note: u8, velocity: u8) {
-        self.write_message(&[0x90 | midi_channel(channel), midi_data(note), midi_data(velocity)]);
-    }
-
     pub fn note_off(&self, channel: u8, note: u8, velocity: u8) {
         self.write_message(&[0x80 | midi_channel(channel), midi_data(note), midi_data(velocity)]);
     }
 
-    pub fn program_change(&self, channel: u8, program: u8) {
-        self.write_message(&[0xC0 | midi_channel(channel), midi_data(program)]);
-    }
-
     pub fn control_change(&self, channel: u8, control: u8, value: u8) {
         self.write_message(&[0xB0 | midi_channel(channel), midi_data(control), midi_data(value)]);
-    }
-
-    pub fn pitch_bend(&self, channel: u8, value: u16) {
-        let value = value.min(16_383);
-        self.write_message(&[0xE0 | midi_channel(channel), (value & 0x7f) as u8, ((value >> 7) & 0x7f) as u8]);
-    }
-
-    pub fn sysex(&self, data: &[u8]) {
-        self.write_message(data);
     }
 
     pub fn silence(&self) {
@@ -193,14 +184,228 @@ impl MidiOutput {
 }
 
 pub struct LibretroAudioSink {
-    pcm: Arc<Mutex<AudioState>>,
-    midi: Arc<MidiOutput>,
+    tx: AudioCommandSender,
 }
 
 impl LibretroAudioSink {
-    pub fn new(pcm: Arc<Mutex<AudioState>>, midi: Arc<MidiOutput>) -> Self {
-        Self { pcm, midi }
+    pub fn new(tx: AudioCommandSender) -> Self {
+        Self { tx }
     }
+}
+
+impl wie_backend::AudioSink for LibretroAudioSink {
+    fn send(&self, command: AudioCommand) {
+        self.tx.send(command);
+    }
+}
+
+enum AudioWorkerCommand {
+    Audio(AudioCommand),
+    Shutdown,
+}
+
+#[derive(Clone)]
+pub struct AudioCommandSender(Sender<AudioWorkerCommand>);
+
+impl AudioCommandSender {
+    fn send(&self, command: AudioCommand) {
+        if self.0.send(AudioWorkerCommand::Audio(command)).is_err() {
+            tracing::warn!("Libretro audio worker is unavailable");
+        }
+    }
+}
+
+pub struct AudioWorker {
+    tx: Sender<AudioWorkerCommand>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AudioWorker {
+    pub fn new(pcm: Arc<Mutex<AudioState>>, midi: Arc<MidiOutput>) -> std::io::Result<(Self, AudioCommandSender)> {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("wie-libretro-audio".into())
+            .spawn(move || run_audio_worker(rx, pcm, midi))?;
+
+        Ok((
+            Self {
+                tx: tx.clone(),
+                worker: Some(worker),
+            },
+            AudioCommandSender(tx),
+        ))
+    }
+
+    pub fn shutdown(&mut self) {
+        let _ = self.tx.send(AudioWorkerCommand::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for AudioWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct Playback {
+    sequence: Arc<AudioSequence>,
+    repeat: bool,
+    started_at: Instant,
+    next_event: usize,
+    active_notes: BTreeSet<(u8, u8)>,
+    used_channels: BTreeSet<u8>,
+}
+
+impl Playback {
+    fn new(sequence: Arc<AudioSequence>, repeat: bool) -> Self {
+        Self {
+            sequence,
+            repeat,
+            started_at: Instant::now(),
+            next_event: 0,
+            active_notes: BTreeSet::new(),
+            used_channels: BTreeSet::new(),
+        }
+    }
+
+    fn next_deadline(&self) -> Instant {
+        let time = self
+            .sequence
+            .events
+            .get(self.next_event)
+            .map_or(self.sequence.duration, |event| event.time);
+        self.started_at + Duration::from_millis(time)
+    }
+}
+
+fn run_audio_worker(rx: Receiver<AudioWorkerCommand>, pcm: Arc<Mutex<AudioState>>, midi: Arc<MidiOutput>) {
+    let mut playbacks = BTreeMap::new();
+
+    loop {
+        let command = if let Some(deadline) = playbacks.values().map(Playback::next_deadline).min() {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(command) => Some(command),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            }
+        };
+
+        if let Some(command) = command {
+            match command {
+                AudioWorkerCommand::Audio(AudioCommand::Play { handle, sequence, repeat }) => {
+                    if let Some(mut playback) = playbacks.remove(&handle) {
+                        cleanup_playback(&midi, &mut playback);
+                    }
+                    playbacks.insert(handle, Playback::new(sequence, repeat));
+                }
+                AudioWorkerCommand::Audio(AudioCommand::Stop { handle }) => {
+                    if let Some(mut playback) = playbacks.remove(&handle) {
+                        cleanup_playback(&midi, &mut playback);
+                    }
+                }
+                AudioWorkerCommand::Shutdown => break,
+            }
+            continue;
+        }
+
+        let now = Instant::now();
+        let handles: Vec<AudioHandle> = playbacks.keys().copied().collect();
+        for handle in handles {
+            let playback = playbacks.get_mut(&handle).unwrap();
+
+            while let Some(event) = playback.sequence.events.get(playback.next_event) {
+                if playback.started_at + Duration::from_millis(event.time) > now {
+                    break;
+                }
+
+                play_audio_event(&pcm, &midi, event, &mut playback.active_notes, &mut playback.used_channels);
+                playback.next_event += 1;
+            }
+
+            if playback.next_event == playback.sequence.events.len() && playback.started_at + Duration::from_millis(playback.sequence.duration) <= now
+            {
+                cleanup_playback(&midi, playback);
+
+                if playback.repeat && playback.sequence.duration != 0 {
+                    playback.started_at = now;
+                    playback.next_event = 0;
+                } else {
+                    playbacks.remove(&handle);
+                }
+            }
+        }
+    }
+
+    for playback in playbacks.values_mut() {
+        cleanup_playback(&midi, playback);
+    }
+}
+
+fn play_audio_event(
+    pcm: &Mutex<AudioState>,
+    midi: &MidiOutput,
+    event: &TimedAudioEvent,
+    active_notes: &mut BTreeSet<(u8, u8)>,
+    used_channels: &mut BTreeSet<u8>,
+) {
+    match &event.data {
+        AudioEventData::Midi(data) => {
+            if let Some(status) = data.first().copied()
+                && (0x80..0xf0).contains(&status)
+            {
+                let channel = status & 0x0f;
+                used_channels.insert(channel);
+
+                if let Some(note) = data.get(1).copied() {
+                    match status & 0xf0 {
+                        0x80 => {
+                            active_notes.remove(&(channel, note));
+                        }
+                        0x90 if data.get(2).copied().unwrap_or(0) == 0 => {
+                            active_notes.remove(&(channel, note));
+                        }
+                        0x90 => {
+                            active_notes.insert((channel, note));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            midi.write_message(data);
+        }
+        AudioEventData::Wave {
+            channels,
+            sampling_rate,
+            samples,
+        } => {
+            if let Ok(mut pcm) = pcm.lock() {
+                pcm.push_wave(*channels, *sampling_rate, samples);
+            }
+        }
+    }
+}
+
+fn cleanup_playback(midi: &MidiOutput, playback: &mut Playback) {
+    for (channel, note) in &playback.active_notes {
+        midi.note_off(*channel, *note, 0);
+    }
+    for channel in &playback.used_channels {
+        midi.control_change(*channel, 64, 0);
+        midi.control_change(*channel, 120, 0);
+        midi.control_change(*channel, 123, 0);
+    }
+
+    playback.active_notes.clear();
+    playback.used_channels.clear();
 }
 
 struct SoftwareMidiSynth {
@@ -398,38 +603,6 @@ fn write_u32(data: &mut [u8], offset: usize, value: u32) -> Option<()> {
     Some(())
 }
 
-impl wie_backend::AudioSink for LibretroAudioSink {
-    fn play_wave(&self, channel: u8, sampling_rate: u32, wave_data: &[i16]) {
-        if let Ok(mut pcm) = self.pcm.lock() {
-            pcm.push_wave(channel, sampling_rate, wave_data);
-        }
-    }
-
-    fn midi_note_on(&self, channel_id: u8, note: u8, velocity: u8) {
-        self.midi.note_on(channel_id, note, velocity);
-    }
-
-    fn midi_note_off(&self, channel_id: u8, note: u8, velocity: u8) {
-        self.midi.note_off(channel_id, note, velocity);
-    }
-
-    fn midi_program_change(&self, channel_id: u8, program: u8) {
-        self.midi.program_change(channel_id, program);
-    }
-
-    fn midi_control_change(&self, channel_id: u8, control: u8, value: u8) {
-        self.midi.control_change(channel_id, control, value);
-    }
-
-    fn midi_pitch_bend(&self, channel_id: u8, value: u16) {
-        self.midi.pitch_bend(channel_id, value);
-    }
-
-    fn midi_sysex(&self, data: &[u8]) {
-        self.midi.sysex(data);
-    }
-}
-
 fn mix_voice(voice: &mut PcmVoice, output_sample_rate: u32, left: &mut [f32], right: &mut [f32]) -> bool {
     let source_frames = voice.data.len() / voice.channels;
     if source_frames == 0 {
@@ -511,7 +684,41 @@ fn float_to_i16(sample: f32) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AUDIO_SAMPLE_RATE, AudioState, MidiOutput};
+    use std::{sync::Arc, time::Instant};
+
+    use wie_backend::{AudioCommand, AudioEventData, AudioSequence, TimedAudioEvent};
+
+    use super::{AUDIO_SAMPLE_RATE, AudioState, AudioWorker, MidiOutput};
+
+    #[test]
+    fn audio_worker_dispatches_timed_wave_events() {
+        let audio = Arc::new(std::sync::Mutex::new(AudioState::new(AUDIO_SAMPLE_RATE)));
+        let midi = Arc::new(MidiOutput::new(false, None, 5));
+        let (mut worker, tx) = AudioWorker::new(audio.clone(), midi).unwrap();
+        tx.send(AudioCommand::Play {
+            handle: 1,
+            sequence: Arc::new(AudioSequence {
+                duration: 0,
+                events: vec![TimedAudioEvent {
+                    time: 0,
+                    data: AudioEventData::Wave {
+                        channels: 1,
+                        sampling_rate: AUDIO_SAMPLE_RATE,
+                        samples: vec![i16::MAX],
+                    },
+                }],
+            }),
+            repeat: false,
+        });
+
+        let timeout = Instant::now() + std::time::Duration::from_secs(1);
+        while audio.lock().unwrap().pcm.is_empty() && Instant::now() < timeout {
+            std::thread::yield_now();
+        }
+
+        worker.shutdown();
+        assert_eq!(audio.lock().unwrap().pcm.len(), 1);
+    }
 
     #[test]
     fn wave_renders_stereo_frames() {
@@ -539,7 +746,7 @@ mod tests {
         let midi = MidiOutput::new(false, None, 5);
         midi.shutdown();
         midi.set_enabled(true);
-        midi.note_on(0, 60, 100);
+        midi.write_message(&[0x90, 60, 100]);
 
         assert!(midi.is_closed());
     }
@@ -547,7 +754,7 @@ mod tests {
     #[test]
     fn midi_output_renders_with_embedded_soundfont() {
         let midi = MidiOutput::new(true, None, 5);
-        midi.note_on(0, 60, 100);
+        midi.write_message(&[0x90, 60, 100]);
         let mut rendered = vec![0; 4096];
 
         midi.render_into(&mut rendered);
@@ -561,7 +768,7 @@ mod tests {
         std::fs::write(&path, include_bytes!("../assets/sines.sf2")).unwrap();
 
         let midi = MidiOutput::new(true, Some(path.clone()), 5);
-        midi.note_on(0, 60, 100);
+        midi.write_message(&[0x90, 60, 100]);
         let mut rendered = vec![0; 4096];
         midi.render_into(&mut rendered);
 
@@ -581,7 +788,7 @@ mod tests {
             }
 
             let midi = MidiOutput::new(true, Some(path), 5);
-            midi.note_on(0, 60, 100);
+            midi.write_message(&[0x90, 60, 100]);
             let mut rendered = vec![0; 4096];
             midi.render_into(&mut rendered);
 
@@ -592,7 +799,7 @@ mod tests {
     #[test]
     fn midi_volume_zero_is_silent() {
         let midi = MidiOutput::new(true, None, 0);
-        midi.note_on(0, 60, 100);
+        midi.write_message(&[0x90, 60, 100]);
         let mut rendered = vec![0; 4096];
 
         midi.render_into(&mut rendered);
