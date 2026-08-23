@@ -4554,9 +4554,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8abadc99fd9c7bbb7d0ca2b31d72a067d0c0dcd7aad25ab8cac71ba91417694b"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 
 [[package]]
 name = "stable_deref_trait"
@@ -6923,7 +6923,7 @@ dependencies = [
 [[package]]
 name = "wipi_types"
 version = "0.0.1"
-source = "git+https://github.com/dlunch/wipi.git#5c744444d139e669e0ddaf5599f441971a71bbc1"
+source = "git+https://github.com/dlunch/wipi.git#4e3d8d3366aa0993f7c6667d3c6b0f4770c8f5ae"
 dependencies = [
  "bytemuck",
  "cfg-if",
