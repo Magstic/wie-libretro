@@ -1,5 +1,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
+use smaf_player::SmafEvent;
+
 pub type AudioHandle = u32;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,7 +31,15 @@ pub struct TimedAudioEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioEventData {
     Midi(Vec<u8>),
-    Wave { channels: u8, sampling_rate: u32, samples: Vec<i16> },
+    Wave {
+        channels: u8,
+        sampling_rate: u32,
+        samples: Vec<i16>,
+    },
+    Smaf {
+        sampling_rate: u32,
+        events: Arc<Vec<(usize, SmafEvent)>>,
+    },
 }
 
 pub trait AudioSink: Sync + Send {

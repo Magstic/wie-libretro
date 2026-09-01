@@ -58,6 +58,13 @@ impl wie_backend::AudioSink for AudioSink {
                             value.push(&JsValue::from(*sampling_rate));
                             value.push(Int16Array::from(samples.as_slice()).as_ref());
                         }
+                        AudioEventData::Smaf { sampling_rate, events } => {
+                            let rendered = smaf_renderer::render_embedded_audio(events, *sampling_rate);
+                            value.push(&JsValue::from_str("wave"));
+                            value.push(&JsValue::from(rendered.channels));
+                            value.push(&JsValue::from(rendered.sampling_rate));
+                            value.push(Int16Array::from(rendered.data.as_slice()).as_ref());
+                        }
                     }
 
                     events.push(value.as_ref());

@@ -19,8 +19,8 @@ zip = { version = "^8.6", features = ["deflate"], default-features = false }
 
 wie_util = { workspace = true }
 
-smaf = { git = "https://github.com/dlunch/smaf.git" }
-smaf_player = { git = "https://github.com/dlunch/smaf.git" }
+smaf = { workspace = true }
+smaf_player = { workspace = true }
 
 [dev-dependencies]
 futures-test = { workspace = true }

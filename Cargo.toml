@@ -51,6 +51,10 @@ spin = { version = "^0.12", features = ["spin_mutex", "rwlock"], default-feature
 toml = { version = "^1", default-features = false, features = ["parse", "serde"] }
 tracing = { version = "^0.1", default-features = false, features = ["attributes"] }
 
+smaf = { git = "https://github.com/Magstic/smaf.git", branch = "ymhtest" }
+smaf_player = { git = "https://github.com/Magstic/smaf.git", branch = "ymhtest" }
+smaf_renderer = { git = "https://github.com/Magstic/smaf.git", branch = "ymhtest" }
+
 java_class_proto = { git = "https://github.com/dlunch/RustJava.git" }
 java_constants = { git = "https://github.com/dlunch/RustJava.git" }
 java_runtime = { git = "https://github.com/dlunch/RustJava.git" }

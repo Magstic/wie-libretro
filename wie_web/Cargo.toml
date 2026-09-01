@@ -21,6 +21,7 @@ console_error_panic_hook = { version = "^0.1" }
 futures = { version = "^0.3", default-features = false, features = ["alloc"] }
 hashbrown = { version = "^0.17" }
 js-sys = { version = "^0.3" }
+smaf_renderer = { workspace = true }
 time = { version = "^0.3", features = ["wasm-bindgen"] }
 tracing = { version = "^0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "^0.3", features = ["time"] }

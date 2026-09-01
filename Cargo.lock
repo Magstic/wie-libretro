@@ -212,7 +212,6 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "arm32_cpu"
 version = "0.1.0"
-source = "git+https://github.com/dlunch/arm32_cpu.git#935471b4650ae02de04abe9acac7feb0aea399c2"
 dependencies = [
  "log",
 ]
@@ -4429,7 +4428,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "smaf"
 version = "0.1.0"
-source = "git+https://github.com/dlunch/smaf.git#8009d78512fd121609a841f31aa527bf2a4af456"
+source = "git+https://github.com/Magstic/smaf.git?branch=ymhtest#f1c1d2d2448554adc7e0ed5ffb200cba434bd934"
 dependencies = [
  "anyhow",
  "nom 7.1.3",
@@ -4439,9 +4438,17 @@ dependencies = [
 [[package]]
 name = "smaf_player"
 version = "0.1.0"
-source = "git+https://github.com/dlunch/smaf.git#8009d78512fd121609a841f31aa527bf2a4af456"
+source = "git+https://github.com/Magstic/smaf.git?branch=ymhtest#f1c1d2d2448554adc7e0ed5ffb200cba434bd934"
 dependencies = [
  "smaf",
+]
+
+[[package]]
+name = "smaf_renderer"
+version = "0.1.0"
+source = "git+https://github.com/Magstic/smaf.git?branch=ymhtest#f1c1d2d2448554adc7e0ed5ffb200cba434bd934"
+dependencies = [
+ "smaf_player",
 ]
 
 [[package]]
@@ -6148,6 +6155,7 @@ dependencies = [
  "gilrs",
  "midir",
  "rodio",
+ "smaf_renderer",
  "softbuffer",
  "tracing",
  "tracing-subscriber",
@@ -6261,6 +6269,7 @@ dependencies = [
  "chrono",
  "elf",
  "futures",
+ "futures-test",
  "java_class_proto",
  "java_constants",
  "java_runtime",
@@ -6287,6 +6296,8 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "rustysynth",
+ "smaf_player",
+ "smaf_renderer",
  "tracing",
  "wie_backend",
  "wie_core_arm",
@@ -6373,6 +6384,7 @@ dependencies = [
  "futures",
  "hashbrown 0.17.1",
  "js-sys",
+ "smaf_renderer",
  "time",
  "tracing",
  "tracing-subscriber",

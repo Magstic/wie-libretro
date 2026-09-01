@@ -17,6 +17,7 @@ directories = { version = "^6.0" }
 gilrs = { version = "^0.11" }
 rodio = { version = "^0.22", features = ["playback"] }
 midir = { version = "^0.11" }
+smaf_renderer = { workspace = true }
 softbuffer = { version = "^0.4" }
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
 winit = { version = "^0.30", features = ["x11", "wayland"] }

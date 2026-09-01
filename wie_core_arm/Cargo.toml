@@ -16,7 +16,7 @@ spin = { workspace = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true }
 
-arm32_cpu = { git = "https://github.com/dlunch/arm32_cpu.git" }
+arm32_cpu = { path = "/home/magstic/Dev/Rust/arm32_cpu" }
 
 wie_backend = { workspace = true }
 wie_util = { workspace = true }

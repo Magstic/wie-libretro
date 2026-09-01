@@ -12,6 +12,7 @@ use std::{
 };
 
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
+use smaf_renderer::EmbeddedRenderer;
 use wie_backend::{AudioCommand, AudioEventData, AudioHandle, AudioSequence, TimedAudioEvent};
 
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -20,6 +21,7 @@ pub const AUDIO_FPS: f64 = 60.0;
 pub struct AudioState {
     sample_rate: u32,
     pcm: Vec<PcmVoice>,
+    smaf: Vec<SmafPcmVoice>,
     left: Vec<f32>,
     right: Vec<f32>,
 }
@@ -29,6 +31,7 @@ impl AudioState {
         Self {
             sample_rate,
             pcm: Vec::new(),
+            smaf: Vec::new(),
             left: Vec::new(),
             right: Vec::new(),
         }
@@ -49,6 +52,7 @@ impl AudioState {
 
     pub fn clear(&mut self) {
         self.pcm.clear();
+        self.smaf.clear();
         self.left.clear();
         self.right.clear();
     }
@@ -70,10 +74,34 @@ impl AudioState {
             }
         }
 
+        let mut index = 0;
+        while index < self.smaf.len() {
+            let finished = self.smaf[index].mix(self.sample_rate, &mut self.left, &mut self.right);
+            if finished {
+                self.smaf.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+
         for (frame, (left, right)) in output.chunks_exact_mut(2).zip(self.left.iter().zip(&self.right)) {
             frame[0] = float_to_i16(*left);
             frame[1] = float_to_i16(*right);
         }
+    }
+
+    fn start_smaf(&mut self, handle: AudioHandle, sequence: &AudioSequence, repeat: bool) {
+        self.stop(handle);
+        for event in &sequence.events {
+            if let AudioEventData::Smaf { sampling_rate, events } = &event.data {
+                self.smaf
+                    .push(SmafPcmVoice::new(handle, *sampling_rate, events.clone(), sequence.duration, repeat));
+            }
+        }
+    }
+
+    fn stop(&mut self, handle: AudioHandle) {
+        self.smaf.retain(|voice| voice.handle != handle);
     }
 }
 
@@ -304,11 +332,17 @@ fn run_audio_worker(rx: Receiver<AudioWorkerCommand>, pcm: Arc<Mutex<AudioState>
                     if let Some(mut playback) = playbacks.remove(&handle) {
                         cleanup_playback(&midi, &mut playback);
                     }
+                    if let Ok(mut pcm) = pcm.lock() {
+                        pcm.start_smaf(handle, &sequence, repeat);
+                    }
                     playbacks.insert(handle, Playback::new(sequence, repeat));
                 }
                 AudioWorkerCommand::Audio(AudioCommand::Stop { handle }) => {
                     if let Some(mut playback) = playbacks.remove(&handle) {
                         cleanup_playback(&midi, &mut playback);
+                    }
+                    if let Ok(mut pcm) = pcm.lock() {
+                        pcm.stop(handle);
                     }
                 }
                 AudioWorkerCommand::Shutdown => break,
@@ -346,6 +380,9 @@ fn run_audio_worker(rx: Receiver<AudioWorkerCommand>, pcm: Arc<Mutex<AudioState>
 
     for playback in playbacks.values_mut() {
         cleanup_playback(&midi, playback);
+    }
+    if let Ok(mut pcm) = pcm.lock() {
+        pcm.smaf.clear();
     }
 }
 
@@ -391,6 +428,7 @@ fn play_audio_event(
                 pcm.push_wave(*channels, *sampling_rate, samples);
             }
         }
+        AudioEventData::Smaf { .. } => {}
     }
 }
 
@@ -634,6 +672,82 @@ struct PcmVoice {
     position: f64,
 }
 
+struct SmafPcmVoice {
+    handle: AudioHandle,
+    renderer: EmbeddedRenderer,
+    sample_rate: u32,
+    repeat: bool,
+    cycle_frames: usize,
+    cycle_position: usize,
+    current: Option<[i16; 2]>,
+    next: Option<[i16; 2]>,
+    fraction: f64,
+}
+
+impl SmafPcmVoice {
+    fn new(handle: AudioHandle, sample_rate: u32, events: Arc<Vec<(usize, smaf_player::SmafEvent)>>, duration_ms: u64, repeat: bool) -> Self {
+        let sample_rate = sample_rate.max(8_000);
+        let mut result = Self {
+            handle,
+            renderer: EmbeddedRenderer::new(events, sample_rate),
+            sample_rate,
+            repeat: repeat && duration_ms != 0,
+            cycle_frames: (duration_ms.saturating_mul(u64::from(sample_rate)) / 1000).min(usize::MAX as u64) as usize,
+            cycle_position: 0,
+            current: None,
+            next: None,
+            fraction: 0.0,
+        };
+        result.current = result.pull_source_frame();
+        result.next = result.pull_source_frame();
+        result
+    }
+
+    fn mix(&mut self, output_sample_rate: u32, left: &mut [f32], right: &mut [f32]) -> bool {
+        let ratio = self.sample_rate as f64 / output_sample_rate as f64;
+        for (left, right) in left.iter_mut().zip(right.iter_mut()) {
+            let Some(current) = self.current else {
+                return true;
+            };
+            let next = self.next.unwrap_or(current);
+            let fraction = self.fraction as f32;
+            *left += lerp_i16(current[0], next[0], fraction) / i16::MAX as f32;
+            *right += lerp_i16(current[1], next[1], fraction) / i16::MAX as f32;
+
+            self.fraction += ratio;
+            while self.fraction >= 1.0 {
+                self.current = self.next;
+                self.next = self.pull_source_frame();
+                self.fraction -= 1.0;
+                if self.current.is_none() {
+                    return true;
+                }
+            }
+        }
+
+        self.current.is_none()
+    }
+
+    fn pull_source_frame(&mut self) -> Option<[i16; 2]> {
+        if self.repeat && self.cycle_position >= self.cycle_frames {
+            self.renderer.restart_cycle();
+            self.cycle_position = 0;
+        }
+
+        if let Some(frame) = self.renderer.next_frame() {
+            self.cycle_position = self.cycle_position.saturating_add(1);
+            return Some(frame);
+        }
+
+        if self.repeat && self.cycle_position < self.cycle_frames {
+            self.cycle_position += 1;
+            Some([0; 2])
+        } else {
+            None
+        }
+    }
+}
+
 impl PcmVoice {
     fn sample(&self, frame_index: usize, next_index: usize, frac: f32) -> (f32, f32) {
         let left = self.sample_channel(frame_index, 0);
@@ -686,6 +800,7 @@ fn float_to_i16(sample: f32) -> i16 {
 mod tests {
     use std::{sync::Arc, time::Instant};
 
+    use smaf_player::{SmafEvent, WaveDynamics};
     use wie_backend::{AudioCommand, AudioEventData, AudioSequence, TimedAudioEvent};
 
     use super::{AUDIO_SAMPLE_RATE, AudioState, AudioWorker, MidiOutput};
@@ -730,6 +845,77 @@ mod tests {
 
         assert!(rendered[0] > 0);
         assert!(rendered[1] > 0);
+    }
+
+    #[test]
+    fn streamed_smaf_matches_the_previous_eager_stem_after_resampling() {
+        let events = Arc::new(vec![(
+            3,
+            SmafEvent::Wave {
+                channels: 1,
+                sampling_rate: 8_000,
+                data: vec![0, 4_000, 16_000, -8_000, 0],
+                dynamics: WaveDynamics {
+                    velocity: 101,
+                    volume: 112,
+                    expression: 93,
+                    pan: Some(79),
+                },
+            },
+        )]);
+        let source_rate = 24_000;
+        let eager = smaf_renderer::render_embedded_audio(&events, source_rate);
+        let sequence = AudioSequence {
+            duration: 20,
+            events: vec![TimedAudioEvent {
+                time: 0,
+                data: AudioEventData::Smaf {
+                    sampling_rate: source_rate,
+                    events,
+                },
+            }],
+        };
+        let mut previous = AudioState::new(AUDIO_SAMPLE_RATE);
+        previous.push_wave(eager.channels, eager.sampling_rate, &eager.data);
+        let mut streamed = AudioState::new(AUDIO_SAMPLE_RATE);
+        streamed.start_smaf(7, &sequence, false);
+        let mut previous_output = vec![0; 256];
+        let mut streamed_output = vec![0; 256];
+
+        previous.render(&mut previous_output);
+        streamed.render(&mut streamed_output);
+
+        assert_eq!(streamed_output, previous_output);
+    }
+
+    #[test]
+    fn stopping_a_smaf_handle_removes_its_streaming_voice() {
+        let sequence = AudioSequence {
+            duration: 100,
+            events: vec![TimedAudioEvent {
+                time: 0,
+                data: AudioEventData::Smaf {
+                    sampling_rate: 24_000,
+                    events: Arc::new(vec![(
+                        0,
+                        SmafEvent::Wave {
+                            channels: 1,
+                            sampling_rate: 8_000,
+                            data: vec![i16::MAX; 800],
+                            dynamics: WaveDynamics::UNITY,
+                        },
+                    )]),
+                },
+            }],
+        };
+        let mut audio = AudioState::new(AUDIO_SAMPLE_RATE);
+        audio.start_smaf(3, &sequence, false);
+        audio.stop(3);
+        let mut output = vec![1; 32];
+
+        audio.render(&mut output);
+
+        assert_eq!(output, vec![0; 32]);
     }
 
     #[test]
