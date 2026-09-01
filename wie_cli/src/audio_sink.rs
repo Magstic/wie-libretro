@@ -218,6 +218,20 @@ fn play_event(
                 SampleTypeConverter::new(samples.iter().copied()).collect::<Vec<_>>(),
             ));
         }
+        AudioEventData::Smaf { sampling_rate, events } => {
+            let Some(player) = player else {
+                return;
+            };
+            let rendered = smaf_renderer::render_embedded_audio(events, *sampling_rate);
+            let (Some(channels), Some(sampling_rate)) = (NonZero::new(rendered.channels.into()), NonZero::new(rendered.sampling_rate)) else {
+                return;
+            };
+            player.append(SamplesBuffer::new(
+                channels,
+                sampling_rate,
+                SampleTypeConverter::new(rendered.data.into_iter()).collect::<Vec<_>>(),
+            ));
+        }
     }
 }
 
